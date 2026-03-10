@@ -10,18 +10,37 @@ class DummyAlpacaClient:
         self.data_type = data_type
 
     def get_bars(self, symbol, timeframe, start, end):
-        # Create dummy data for 20 days
-        # We need a DataFrame with a 'close' column
+        # We need at least 50 days of data for the 50-day SMA.
+        # Let's provide 100 days of data to be safe.
 
-        if self.data_type == 'normal':
-            # RSI should be around 50
-            closes = [100 + i % 3 for i in range(25)]
-        elif self.data_type == 'oversold':
-            # Continuous drop, RSI should be near 0
-            closes = [100 - i * 2 for i in range(25)]
-        elif self.data_type == 'overbought':
-            # Continuous rise, RSI should be near 100
-            closes = [100 + i * 2 for i in range(25)]
+        if self.data_type == 'bullish_oversold_bounce':
+            # Price > 50 SMA, RSI < 30, current > previous
+            closes = [10] * 80
+            closes += [10000] * 20
+            for i in range(11):
+                closes.append(10000 - i * 420)
+            closes.append(6000)
+        elif self.data_type == 'bullish_oversold_falling':
+            # Price > 50 SMA, RSI < 30, current <= previous
+            closes = [10] * 80
+            closes += [10000] * 18
+            for i in range(11):
+                closes.append(10000 - i * 420)
+            closes.append(5800)
+        elif self.data_type == 'bearish_oversold_bounce':
+            # Price <= 50 SMA, RSI < 30, current > previous
+            closes = [10000] * 80
+            closes += [10000] * 20
+            for i in range(11):
+                closes.append(10000 - i * 420)
+            closes.append(6000)
+        elif self.data_type == 'bullish_normal':
+            # Price > 50 SMA, RSI >= 30, current > previous
+            closes = [10] * 80
+            closes += [10000] * 20
+            for i in range(11):
+                closes.append(10000 - i * 100)
+            closes.append(9200)
         elif self.data_type == 'too_short':
             closes = [100, 101, 102]
         else:
@@ -30,39 +49,42 @@ class DummyAlpacaClient:
         df = pd.DataFrame({'close': closes})
         return DummyBars(df)
 
+    def get_stock_bars(self, req):
+        # Provide fallback for new Alpaca SDK just in case
+        return self.get_bars(req.symbol_or_symbols, req.timeframe, req.start, req.end)
 
 def test_strategy():
     print("Running strategy tests...")
 
-    # Test 1: Normal market (RSI > 30)
-    client1 = DummyAlpacaClient('normal')
+    client1 = DummyAlpacaClient('bullish_oversold_bounce')
     res1 = check_rsi_buy_signal(client1, "AAPL")
-    print(f"Test 1 (Normal Market): Expected False, Got {res1}")
-    assert res1 == False
+    print(f"Test 1 (Bullish Oversold Bounce): Expected True, Got {res1}")
+    assert res1 == True
 
-    # Test 2: Oversold market (RSI < 30)
-    client2 = DummyAlpacaClient('oversold')
+    client2 = DummyAlpacaClient('bullish_oversold_falling')
     res2 = check_rsi_buy_signal(client2, "AAPL")
-    print(f"Test 2 (Oversold Market): Expected True, Got {res2}")
-    assert res2 == True
+    print(f"Test 2 (Bullish Oversold Falling): Expected False, Got {res2}")
+    assert res2 == False
 
-    # Test 3: Overbought market (RSI > 30)
-    client3 = DummyAlpacaClient('overbought')
+    client3 = DummyAlpacaClient('bearish_oversold_bounce')
     res3 = check_rsi_buy_signal(client3, "AAPL")
-    print(f"Test 3 (Overbought Market): Expected False, Got {res3}")
+    print(f"Test 3 (Bearish Oversold Bounce): Expected False, Got {res3}")
     assert res3 == False
 
-    # Test 4: Not enough data
-    client4 = DummyAlpacaClient('too_short')
+    client4 = DummyAlpacaClient('bullish_normal')
     res4 = check_rsi_buy_signal(client4, "AAPL")
-    print(f"Test 4 (Not Enough Data): Expected False, Got {res4}")
+    print(f"Test 4 (Bullish Normal): Expected False, Got {res4}")
     assert res4 == False
 
-    # Test 5: API Error
-    client5 = DummyAlpacaClient('error')
+    client5 = DummyAlpacaClient('too_short')
     res5 = check_rsi_buy_signal(client5, "AAPL")
-    print(f"Test 5 (API Error): Expected False, Got {res5}")
+    print(f"Test 5 (Not Enough Data): Expected False, Got {res5}")
     assert res5 == False
+
+    client6 = DummyAlpacaClient('error')
+    res6 = check_rsi_buy_signal(client6, "AAPL")
+    print(f"Test 6 (API Error): Expected False, Got {res6}")
+    assert res6 == False
 
     print("All strategy tests passed.")
 
