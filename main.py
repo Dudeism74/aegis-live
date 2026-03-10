@@ -1,0 +1,227 @@
+import os
+import sys
+import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timezone
+import gspread
+import json
+try:
+    import zoneinfo
+except ImportError:
+    from backports import zoneinfo
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+
+import risk_manager
+import portfolio
+import strategy
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def send_email(subject, body):
+    sender_email = os.environ.get("SENDER_EMAIL")
+    sender_password = os.environ.get("SENDER_PASSWORD")
+    recipient_email = os.environ.get("RECIPIENT_EMAIL")
+
+    if not sender_email or not sender_password or not recipient_email:
+        logging.warning("Email credentials not set. Skipping email.")
+        return
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        text = msg.as_string()
+        server.sendmail(sender_email, recipient_email, text)
+        server.quit()
+        logging.info("Email sent successfully.")
+    except Exception as e:
+        logging.error(f"Failed to send email: {e}")
+
+def main():
+    messages = []
+    messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d')}\n")
+
+    # 1. Initialize Alpaca trading client, gspread
+    try:
+        api_key = os.environ.get("ALPACA_API_KEY", "dummy_key")
+        api_secret = os.environ.get("ALPACA_SECRET_KEY", "dummy_secret")
+        trading_client = TradingClient(api_key, api_secret, paper=True)
+        logging.info("Alpaca Trading Client initialized.")
+    except Exception as e:
+        msg = f"Failed to initialize Alpaca Trading Client: {e}"
+        logging.error(msg)
+        messages.append(msg)
+        send_email("Aegis Trading Error", "\n".join(messages))
+        sys.exit(1)
+
+    try:
+        # Initialize Google Sheets
+        gc = None
+        # Example initialization (can be overridden with proper credentials)
+        if os.environ.get("GSPREAD_CREDENTIALS"):
+            gc = gspread.service_account_from_dict(json.loads(os.environ.get("GSPREAD_CREDENTIALS")))
+        else:
+            try:
+                gc = gspread.service_account()
+            except Exception:
+                pass
+
+        if gc:
+            sheet = gc.open('Aegis Trading Log').sheet1
+            logging.info("Google Sheets initialized.")
+        else:
+            sheet = None
+            logging.warning("Google Sheets credentials not found. Logging to sheets disabled.")
+    except Exception as e:
+        logging.error(f"Failed to initialize gspread: {e}")
+        sheet = None
+
+    # 2. Check if market is open
+    try:
+        clock = trading_client.get_clock()
+        if not clock.is_open:
+            logging.info("Market is currently closed. Exiting.")
+            sys.exit(0)
+    except Exception as e:
+        logging.error(f"Failed to check market status: {e}")
+        sys.exit(1)
+
+    # 3. Check VIX kill switch
+    try:
+        if risk_manager.check_vix_kill_switch():
+            msg = "VIX > 30. Kill switch activated. Exiting without trading."
+            logging.info(msg)
+            messages.append(msg)
+            send_email("Aegis Trading Alert: VIX Kill Switch", "\n".join(messages))
+            sys.exit(0)
+    except Exception as e:
+        logging.error(f"Error checking VIX kill switch: {e}")
+
+    # Variables to track actions
+    successful_trades = []
+
+    # 4. Manage Sells
+    try:
+        positions = trading_client.get_all_positions()
+
+        # Get today's filled orders for PDT shield
+        # Use US/Eastern time for PDT calculation
+        try:
+            ny_tz = zoneinfo.ZoneInfo("America/New_York")
+        except Exception:
+            # Fallback if zoneinfo is not available or tzdata is missing
+            ny_tz = timezone.utc
+
+        now_ny = datetime.now(ny_tz)
+        today_ny = now_ny.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Alpaca API expects UTC for timestamps
+        today_utc = today_ny.astimezone(timezone.utc)
+
+        req = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            limit=500,
+            after=today_utc
+        )
+        recent_orders = trading_client.get_orders(req)
+
+        # Identify tickers bought today
+        bought_today = set()
+        for order in recent_orders:
+            if order.side == OrderSide.BUY and order.filled_at and order.filled_at >= today_utc:
+                bought_today.add(order.symbol)
+
+        for position in positions:
+            symbol = position.symbol
+            if symbol in bought_today:
+                logging.info(f"PDT Shield: {symbol} was bought today. Skipping sell check.")
+                continue
+
+            unrealized_plpc = float(position.unrealized_plpc)
+
+            if unrealized_plpc >= 0.10 or unrealized_plpc <= -0.05:
+                reason = "Take Profit" if unrealized_plpc >= 0.10 else "Stop Loss"
+                logging.info(f"Triggering {reason} for {symbol} (PLPC: {unrealized_plpc:.2%}).")
+                try:
+                    market_order_data = MarketOrderRequest(
+                        symbol=symbol,
+                        qty=position.qty,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    trading_client.submit_order(order_data=market_order_data)
+                    msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
+                    logging.info(msg)
+                    messages.append(msg)
+                    successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "SELL", float(position.qty), reason])
+                except Exception as e:
+                    logging.error(f"Failed to sell {symbol}: {e}")
+            else:
+                logging.info(f"Holding {symbol} (PLPC: {unrealized_plpc:.2%}).")
+    except Exception as e:
+        logging.error(f"Error during sell management: {e}")
+
+    # 5. Scan for Buys
+    tickers_to_scan = ['AAPL', 'AMZN', 'CAT', 'CL', 'GE', 'GOOGL', 'GS', 'JPM', 'LLY', 'META', 'MSFT', 'NOC', 'NVDA', 'RTX', 'UNH', 'WMT', 'XOM']
+
+    try:
+        positions = trading_client.get_all_positions()
+        owned_tickers = {p.symbol for p in positions}
+
+        for ticker in tickers_to_scan:
+            if ticker in owned_tickers:
+                logging.info(f"Already own {ticker}. Skipping buy check.")
+                continue
+
+            if strategy.check_rsi_buy_signal(trading_client, ticker):
+                logging.info(f"Buy signal triggered for {ticker}.")
+                size_usd = portfolio.calculate_position_size(trading_client)
+
+                if size_usd > 0:
+                    try:
+                        market_order_data = MarketOrderRequest(
+                            symbol=ticker,
+                            notional=size_usd,
+                            side=OrderSide.BUY,
+                            time_in_force=TimeInForce.DAY
+                        )
+                        trading_client.submit_order(order_data=market_order_data)
+                        msg = f"BUY ${size_usd:.2f} of {ticker} at market"
+                        logging.info(msg)
+                        messages.append(msg)
+                        successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "BUY", size_usd, "RSI Strategy"])
+                    except Exception as e:
+                        logging.error(f"Failed to buy {ticker}: {e}")
+                else:
+                    logging.info(f"Insufficient funds to buy {ticker}.")
+            else:
+                logging.info(f"No buy signal for {ticker}.")
+    except Exception as e:
+        logging.error(f"Error during buy scanning: {e}")
+
+    # 6. Wrap up
+    try:
+        if sheet and successful_trades:
+            for trade in successful_trades:
+                sheet.append_row(trade)
+            logging.info("Trades logged to Google Sheets.")
+    except Exception as e:
+        logging.error(f"Failed to log to Google Sheets: {e}")
+
+    messages.append("\nTrading complete for the day.")
+    send_email("Aegis Daily Trading Report", "\n".join(messages))
+
+if __name__ == "__main__":
+    main()
