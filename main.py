@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import logging
 import smtplib
 from email.mime.text import MIMEText
@@ -49,10 +50,7 @@ def send_email(subject, body):
     except Exception as e:
         logging.error(f"Failed to send email: {e}")
 
-def main():
-    messages = []
-    messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d')}\n")
-
+def run_scanner():
     # 1. Initialize Alpaca trading client, gspread
     try:
         api_key = os.environ.get("ALPACA_API_KEY", "dummy_key")
@@ -88,140 +86,146 @@ def main():
         logging.error(f"Failed to initialize gspread: {e}")
         sheet = None
 
-    # 2. Check if market is open
-    try:
-        clock = trading_client.get_clock()
-        if not clock.is_open:
-            logging.info("Market is currently closed. Exiting.")
-            sys.exit(0)
-    except Exception as e:
-        logging.error(f"Failed to check market status: {e}")
-        sys.exit(1)
+    while True:
+        messages = []
+        messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d')}\n")
 
-    # 3. Check VIX kill switch
-    try:
-        if risk_manager.check_vix_kill_switch():
-            msg = "VIX > 30. Kill switch activated. Exiting without trading."
-            logging.info(msg)
-            messages.append(msg)
-            send_email("Aegis Trading Alert: VIX Kill Switch", "\n".join(messages))
-            sys.exit(0)
-    except Exception as e:
-        logging.error(f"Error checking VIX kill switch: {e}")
-
-    # Variables to track actions
-    successful_trades = []
-
-    # 4. Manage Sells
-    try:
-        positions = trading_client.get_all_positions()
-
-        # Get today's filled orders for PDT shield
-        # Use US/Eastern time for PDT calculation
+        # 2. Check if market is open
         try:
-            ny_tz = zoneinfo.ZoneInfo("America/New_York")
-        except Exception:
-            # Fallback if zoneinfo is not available or tzdata is missing
-            ny_tz = timezone.utc
-
-        now_ny = datetime.now(ny_tz)
-        today_ny = now_ny.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        # Alpaca API expects UTC for timestamps
-        today_utc = today_ny.astimezone(timezone.utc)
-
-        req = GetOrdersRequest(
-            status=QueryOrderStatus.CLOSED,
-            limit=500,
-            after=today_utc
-        )
-        recent_orders = trading_client.get_orders(req)
-
-        # Identify tickers bought today
-        bought_today = set()
-        for order in recent_orders:
-            if order.side == OrderSide.BUY and order.filled_at and order.filled_at >= today_utc:
-                bought_today.add(order.symbol)
-
-        for position in positions:
-            symbol = position.symbol
-            if symbol in bought_today:
-                logging.info(f"PDT Shield: {symbol} was bought today. Skipping sell check.")
+            clock = trading_client.get_clock()
+            if not clock.is_open:
+                logging.info("Market Closed - Sleeping")
+                time.sleep(300)
                 continue
+        except Exception as e:
+            logging.error(f"Failed to check market status: {e}")
+            time.sleep(300)
+            continue
 
-            unrealized_plpc = float(position.unrealized_plpc)
+        # 3. Check VIX kill switch
+        try:
+            if risk_manager.check_vix_kill_switch():
+                msg = "VIX > 30. Kill switch activated. Exiting without trading."
+                logging.info(msg)
+                messages.append(msg)
+                send_email("Aegis Trading Alert: VIX Kill Switch", "\n".join(messages))
+                send_email("Aegis Daily Trading Report", "\n".join(messages))
+                break
+        except Exception as e:
+            logging.error(f"Error checking VIX kill switch: {e}")
 
-            if unrealized_plpc >= 0.10 or unrealized_plpc <= -0.05:
-                reason = "Take Profit" if unrealized_plpc >= 0.10 else "Stop Loss"
-                logging.info(f"Triggering {reason} for {symbol} (PLPC: {unrealized_plpc:.2%}).")
-                try:
-                    market_order_data = MarketOrderRequest(
-                        symbol=symbol,
-                        qty=position.qty,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY
-                    )
-                    trading_client.submit_order(order_data=market_order_data)
-                    msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
-                    logging.info(msg)
-                    messages.append(msg)
-                    successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "SELL", float(position.qty), reason])
-                except Exception as e:
-                    logging.error(f"Failed to sell {symbol}: {e}")
-            else:
-                logging.info(f"Holding {symbol} (PLPC: {unrealized_plpc:.2%}).")
-    except Exception as e:
-        logging.error(f"Error during sell management: {e}")
+        # Variables to track actions
+        successful_trades = []
 
-    # 5. Scan for Buys
-    tickers_to_scan = ['AAPL', 'AMZN', 'CAT', 'CL', 'GE', 'GOOGL', 'GS', 'JPM', 'LLY', 'META', 'MSFT', 'NOC', 'NVDA', 'RTX', 'UNH', 'WMT', 'XOM']
+        # 4. Manage Sells
+        try:
+            positions = trading_client.get_all_positions()
 
-    try:
-        positions = trading_client.get_all_positions()
-        owned_tickers = {p.symbol for p in positions}
+            # Get today's filled orders for PDT shield
+            # Use US/Eastern time for PDT calculation
+            try:
+                ny_tz = zoneinfo.ZoneInfo("America/New_York")
+            except Exception:
+                # Fallback if zoneinfo is not available or tzdata is missing
+                ny_tz = timezone.utc
 
-        for ticker in tickers_to_scan:
-            if ticker in owned_tickers:
-                logging.info(f"Already own {ticker}. Skipping buy check.")
-                continue
+            now_ny = datetime.now(ny_tz)
+            today_ny = now_ny.replace(hour=0, minute=0, second=0, microsecond=0)
 
-            if strategy.check_rsi_buy_signal(trading_client, ticker):
-                logging.info(f"Buy signal triggered for {ticker}.")
-                size_usd = portfolio.calculate_position_size(trading_client)
+            # Alpaca API expects UTC for timestamps
+            today_utc = today_ny.astimezone(timezone.utc)
 
-                if size_usd > 0:
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                limit=500,
+                after=today_utc
+            )
+            recent_orders = trading_client.get_orders(req)
+
+            # Identify tickers bought today
+            bought_today = set()
+            for order in recent_orders:
+                if order.side == OrderSide.BUY and order.filled_at and order.filled_at >= today_utc:
+                    bought_today.add(order.symbol)
+
+            for position in positions:
+                symbol = position.symbol
+                if symbol in bought_today:
+                    logging.info(f"PDT Shield: {symbol} was bought today. Skipping sell check.")
+                    continue
+
+                unrealized_plpc = float(position.unrealized_plpc)
+
+                if unrealized_plpc >= 0.10 or unrealized_plpc <= -0.05:
+                    reason = "Take Profit" if unrealized_plpc >= 0.10 else "Stop Loss"
+                    logging.info(f"Triggering {reason} for {symbol} (PLPC: {unrealized_plpc:.2%}).")
                     try:
                         market_order_data = MarketOrderRequest(
-                            symbol=ticker,
-                            notional=size_usd,
-                            side=OrderSide.BUY,
+                            symbol=symbol,
+                            qty=position.qty,
+                            side=OrderSide.SELL,
                             time_in_force=TimeInForce.DAY
                         )
                         trading_client.submit_order(order_data=market_order_data)
-                        msg = f"BUY ${size_usd:.2f} of {ticker} at market"
+                        msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
                         logging.info(msg)
                         messages.append(msg)
-                        successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "BUY", size_usd, "RSI Strategy"])
+                        successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "SELL", float(position.qty), reason])
                     except Exception as e:
-                        logging.error(f"Failed to buy {ticker}: {e}")
+                        logging.error(f"Failed to sell {symbol}: {e}")
                 else:
-                    logging.info(f"Insufficient funds to buy {ticker}.")
-            else:
-                logging.info(f"No buy signal for {ticker}.")
-    except Exception as e:
-        logging.error(f"Error during buy scanning: {e}")
+                    logging.info(f"Holding {symbol} (PLPC: {unrealized_plpc:.2%}).")
+        except Exception as e:
+            logging.error(f"Error during sell management: {e}")
 
-    # 6. Wrap up
-    try:
-        if sheet and successful_trades:
-            for trade in successful_trades:
-                sheet.append_row(trade)
-            logging.info("Trades logged to Google Sheets.")
-    except Exception as e:
-        logging.error(f"Failed to log to Google Sheets: {e}")
+        # 5. Scan for Buys
+        tickers_to_scan = ['AAPL', 'AMZN', 'CAT', 'CL', 'GE', 'GOOGL', 'GS', 'JPM', 'LLY', 'META', 'MSFT', 'NOC', 'NVDA', 'RTX', 'UNH', 'WMT', 'XOM']
 
-    messages.append("\nTrading complete for the day.")
-    send_email("Aegis Daily Trading Report", "\n".join(messages))
+        try:
+            positions = trading_client.get_all_positions()
+            owned_tickers = {p.symbol for p in positions}
+
+            for ticker in tickers_to_scan:
+                if ticker in owned_tickers:
+                    logging.info(f"Already own {ticker}. Skipping buy check.")
+                    continue
+
+                if strategy.check_rsi_buy_signal(trading_client, ticker):
+                    logging.info(f"Buy signal triggered for {ticker}.")
+                    size_usd = portfolio.calculate_position_size(trading_client)
+
+                    if size_usd > 0:
+                        try:
+                            market_order_data = MarketOrderRequest(
+                                symbol=ticker,
+                                notional=size_usd,
+                                side=OrderSide.BUY,
+                                time_in_force=TimeInForce.DAY
+                            )
+                            trading_client.submit_order(order_data=market_order_data)
+                            msg = f"BUY ${size_usd:.2f} of {ticker} at market"
+                            logging.info(msg)
+                            messages.append(msg)
+                            successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "BUY", size_usd, "RSI Strategy"])
+                        except Exception as e:
+                            logging.error(f"Failed to buy {ticker}: {e}")
+                    else:
+                        logging.info(f"Insufficient funds to buy {ticker}.")
+                else:
+                    logging.info(f"No buy signal for {ticker}.")
+        except Exception as e:
+            logging.error(f"Error during buy scanning: {e}")
+
+        # 6. Wrap up
+        try:
+            if sheet and successful_trades:
+                for trade in successful_trades:
+                    sheet.append_row(trade)
+                logging.info("Trades logged to Google Sheets.")
+        except Exception as e:
+            logging.error(f"Failed to log to Google Sheets: {e}")
+
+        time.sleep(300)
 
 if __name__ == "__main__":
-    main()
+    run_scanner()
