@@ -14,8 +14,10 @@ except ImportError:
     from backports import zoneinfo
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockSnapshotRequest
 
 import risk_manager
 import portfolio
@@ -56,11 +58,12 @@ def run_scanner():
         api_key = os.environ.get("ALPACA_API_KEY", "dummy_key")
         api_secret = os.environ.get("ALPACA_SECRET_KEY", "dummy_secret")
         trading_client = TradingClient(api_key, api_secret, paper=True)
-        logging.info("Alpaca Trading Client initialized.")
+        data_client = StockHistoricalDataClient(api_key, api_secret)
+        logging.info("Alpaca Trading Client and Data Client initialized.")
     except Exception as e:
-        msg = f"Failed to initialize Alpaca Trading Client: {e}"
+        msg = f"Failed to initialize Alpaca Clients: {e}"
         logging.error(msg)
-        messages.append(msg)
+        messages = [msg]
         send_email("Aegis Trading Error", "\n".join(messages))
         sys.exit(1)
 
@@ -160,14 +163,30 @@ def run_scanner():
                     reason = "Take Profit" if unrealized_plpc >= 0.10 else "Stop Loss"
                     logging.info(f"Triggering {reason} for {symbol} (PLPC: {unrealized_plpc:.2%}).")
                     try:
-                        market_order_data = MarketOrderRequest(
-                            symbol=symbol,
-                            qty=position.qty,
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.DAY
-                        )
-                        trading_client.submit_order(order_data=market_order_data)
-                        msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
+                        if unrealized_plpc >= 0.10:
+                            snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
+                            current_price = snapshot.latest_trade.price
+                            limit_price = round(current_price * 0.995, 2)
+                            
+                            order_data = LimitOrderRequest(
+                                symbol=symbol,
+                                qty=position.qty,
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.DAY,
+                                limit_price=limit_price
+                            )
+                            trading_client.submit_order(order_data=order_data)
+                            msg = f"SELL {position.qty} shares of {symbol} at limit ({reason})"
+                        else:
+                            order_data = MarketOrderRequest(
+                                symbol=symbol,
+                                qty=position.qty,
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.DAY
+                            )
+                            trading_client.submit_order(order_data=order_data)
+                            msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
+                            
                         logging.info(msg)
                         messages.append(msg)
                         successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "SELL", float(position.qty), reason])
@@ -190,20 +209,26 @@ def run_scanner():
                     logging.info(f"Already own {ticker}. Skipping buy check.")
                     continue
 
-                if strategy.check_rsi_buy_signal(trading_client, ticker):
+                if strategy.check_rsi_buy_signal(data_client, ticker):
                     logging.info(f"Buy signal triggered for {ticker}.")
                     size_usd = portfolio.calculate_position_size(trading_client)
 
                     if size_usd > 0:
                         try:
-                            market_order_data = MarketOrderRequest(
+                            snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=ticker))[ticker]
+                            current_price = snapshot.latest_trade.price
+                            limit_price = round(current_price * 1.005, 2)
+                            qty = round(size_usd / current_price, 4)
+                            
+                            order_data = LimitOrderRequest(
                                 symbol=ticker,
-                                notional=size_usd,
+                                qty=qty,
                                 side=OrderSide.BUY,
-                                time_in_force=TimeInForce.DAY
+                                time_in_force=TimeInForce.DAY,
+                                limit_price=limit_price
                             )
-                            trading_client.submit_order(order_data=market_order_data)
-                            msg = f"BUY ${size_usd:.2f} of {ticker} at market"
+                            trading_client.submit_order(order_data=order_data)
+                            msg = f"BUY {qty} shares of {ticker} at limit ${limit_price} (${size_usd:.2f} total)"
                             logging.info(msg)
                             messages.append(msg)
                             successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "BUY", size_usd, "RSI Strategy"])

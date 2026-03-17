@@ -2,8 +2,10 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import ta
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.requests import StockBarsRequest
 
-def check_rsi_buy_signal(alpaca_client, symbol):
+def check_rsi_buy_signal(data_client, symbol):
     """
     Fetches the last 100 days of daily closing prices for the given symbol,
     calculates the 50-day SMA and 14-day RSI. Returns True ONLY if:
@@ -17,28 +19,16 @@ def check_rsi_buy_signal(alpaca_client, symbol):
         end_date = datetime.now()
         start_date = end_date - timedelta(days=100)
 
-        # In this project, Alpaca SDK is used. The interface depends on whether
-        # alpaca-py or alpaca-trade-api is used. Let's try duck typing.
-        try:
-            # Try older/standard alpaca-trade-api
-            bars = alpaca_client.get_bars(
-                symbol,
-                "1Day",
-                start=start_date.strftime('%Y-%m-%d'),
-                end=end_date.strftime('%Y-%m-%d')
-            ).df
-        except Exception:
-            # Fallback to newer alpaca-py
-            from alpaca.data.timeframe import TimeFrame
-            from alpaca.data.requests import StockBarsRequest
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=start_date,
+            end=end_date
+        )
+        bars = data_client.get_stock_bars(req).df
 
-            req = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Day,
-                start=start_date,
-                end=end_date
-            )
-            bars = alpaca_client.get_stock_bars(req).df
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.xs(symbol, level=0)
 
         # We need at least 50 days of data to compute a 50-day SMA
         if len(bars) < 50:
