@@ -23,6 +23,24 @@ import risk_manager
 import portfolio
 import strategy
 
+def load_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, val = line.split('=', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if val.startswith(('"', "'")) and val.endswith(('"', "'")) and len(val) >= 2:
+                        val = val[1:-1]
+                    os.environ[key] = val
+
+load_env()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -55,8 +73,8 @@ def send_email(subject, body):
 def run_scanner():
     # 1. Initialize Alpaca trading client, gspread
     try:
-        api_key = os.environ.get("ALPACA_API_KEY", "dummy_key")
-        api_secret = os.environ.get("ALPACA_SECRET_KEY", "dummy_secret")
+        api_key = os.environ.get("APCA_API_KEY_ID", "dummy_key")
+        api_secret = os.environ.get("APCA_API_SECRET_KEY", "dummy_secret")
         trading_client = TradingClient(api_key, api_secret, paper=True)
         data_client = StockHistoricalDataClient(api_key, api_secret)
         logging.info("Alpaca Trading Client and Data Client initialized.")
