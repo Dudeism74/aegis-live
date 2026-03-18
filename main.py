@@ -127,11 +127,10 @@ def run_scanner():
         try:
             if risk_manager.check_vix_kill_switch():
                 msg = "VIX > 30. Kill switch activated. Exiting without trading."
-                logging.info(msg)
+                logging.warning(msg)
                 messages.append(msg)
-                send_email("Aegis Trading Alert: VIX Kill Switch", "\n".join(messages))
-                send_email("Aegis Daily Trading Report", "\n".join(messages))
-                break
+                time.sleep(300)
+                continue
         except Exception as e:
             logging.error(f"Error checking VIX kill switch: {e}")
 
@@ -267,6 +266,10 @@ def run_scanner():
                 logging.info("Trades logged to Google Sheets.")
         except Exception as e:
             logging.error(f"Failed to log to Google Sheets: {e}")
+
+        if successful_trades:
+            compiled_string = "\n".join(messages)
+            send_email("Aegis Trade Alert", compiled_string)
 
         time.sleep(300)
 
