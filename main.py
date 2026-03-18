@@ -22,24 +22,9 @@ from alpaca.data.requests import StockSnapshotRequest
 import risk_manager
 import portfolio
 import strategy
+from dotenv import load_dotenv
 
-def load_env():
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-    if os.path.exists(env_path):
-        with open(env_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if '=' in line:
-                    key, val = line.split('=', 1)
-                    key = key.strip()
-                    val = val.strip()
-                    if val.startswith(('"', "'")) and val.endswith(('"', "'")) and len(val) >= 2:
-                        val = val[1:-1]
-                    os.environ[key] = val
-
-load_env()
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
