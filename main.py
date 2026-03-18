@@ -74,14 +74,8 @@ def run_scanner():
     try:
         # Initialize Google Sheets
         gc = None
-        # Example initialization (can be overridden with proper credentials)
-        if os.environ.get("GSPREAD_CREDENTIALS"):
-            gc = gspread.service_account_from_dict(json.loads(os.environ.get("GSPREAD_CREDENTIALS")))
-        else:
-            try:
-                gc = gspread.service_account()
-            except Exception:
-                pass
+        cred_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
+        gc = gspread.service_account(filename=cred_path)
 
         if gc:
             sheet = gc.open('Aegis Trading Log').sheet1
