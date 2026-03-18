@@ -4,6 +4,7 @@ import numpy as np
 import ta
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.enums import DataFeed
 
 def check_rsi_buy_signal(data_client, symbol):
     """
@@ -23,7 +24,8 @@ def check_rsi_buy_signal(data_client, symbol):
             symbol_or_symbols=symbol,
             timeframe=TimeFrame.Day,
             start=start_date,
-            end=end_date
+            end=end_date,
+            feed=DataFeed.IEX
         )
         bars = data_client.get_stock_bars(req).df
 
