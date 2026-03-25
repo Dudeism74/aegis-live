@@ -14,28 +14,28 @@ class DummyAlpacaClient:
         # Let's provide 100 days of data to be safe.
 
         if self.data_type == 'bullish_oversold_bounce':
-            # Price > 50 SMA, RSI < 30, current > previous
+            # Price > 50 SMA, RSI < 40, current > previous
             closes = [10] * 80
             closes += [10000] * 20
             for i in range(11):
-                closes.append(10000 - i * 420)
-            closes.append(6000)
+                closes.append(10000 - i * 300)
+            closes.append(7300)
         elif self.data_type == 'bullish_oversold_falling':
-            # Price > 50 SMA, RSI < 30, current <= previous
+            # Price > 50 SMA, RSI < 40, current <= previous
             closes = [10] * 80
             closes += [10000] * 18
             for i in range(11):
-                closes.append(10000 - i * 420)
-            closes.append(5800)
+                closes.append(10000 - i * 300)
+            closes.append(6900)
         elif self.data_type == 'bearish_oversold_bounce':
-            # Price <= 50 SMA, RSI < 30, current > previous
+            # Price <= 50 SMA, RSI < 40, current > previous
             closes = [10000] * 80
             closes += [10000] * 20
             for i in range(11):
-                closes.append(10000 - i * 420)
-            closes.append(6000)
+                closes.append(10000 - i * 300)
+            closes.append(7100)
         elif self.data_type == 'bullish_normal':
-            # Price > 50 SMA, RSI >= 30, current > previous
+            # Price > 50 SMA, RSI >= 40, current > previous
             closes = [10] * 80
             closes += [10000] * 20
             for i in range(11):

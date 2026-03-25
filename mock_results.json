@@ -1,0 +1,26 @@
+{
+  "bullish_oversold_bounce": {
+    "rsi": 38.984979193216894,
+    "sma": 6019.6,
+    "curr": 7300.0,
+    "prev": 7000.0
+  },
+  "bullish_oversold_falling": {
+    "rsi": 35.230040111408584,
+    "sma": 5612.0,
+    "curr": 6900.0,
+    "prev": 7000.0
+  },
+  "bearish_oversold_bounce": {
+    "rsi": 4.670139346084326,
+    "sma": 9612.0,
+    "curr": 7100.0,
+    "prev": 7000.0
+  },
+  "bullish_normal": {
+    "rsi": 63.89701764633033,
+    "sma": 6277.6,
+    "curr": 9200.0,
+    "prev": 9000.0
+  }
+}
