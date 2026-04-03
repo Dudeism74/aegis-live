@@ -11,7 +11,7 @@ def check_rsi_buy_signal(data_client, symbol):
     Fetches the last 100 days of daily closing prices for the given symbol,
     calculates the 50-day SMA and 14-day RSI. Returns True ONLY if:
     1) Current price is > 50-day SMA
-    2) 14-day RSI is < 40
+    2) 14-day RSI is < 50
     3) Current price > previous day's close (bounce confirmation)
     """
     try:
@@ -55,12 +55,17 @@ def check_rsi_buy_signal(data_client, symbol):
 
         # Evaluate the conditions:
         # 1) Current price > 50-day SMA
-        # 2) 14-day RSI < 40
+        # 2) 14-day RSI < 50
         # 3) Current price > previous day's close
-        if current_price > current_sma and current_rsi < 40 and current_price > previous_price:
-            return True
+        is_buy = current_price > current_sma and current_rsi < 50 and current_price > previous_price
 
-        return False
+        import logging
+        if is_buy:
+            logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: BUY (Threshold: < 50)")
+        else:
+            logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: HOLD (Threshold: < 50)")
+
+        return is_buy
 
     except Exception as e:
         # Handle any API connection errors or other exceptions
