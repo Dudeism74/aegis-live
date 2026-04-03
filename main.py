@@ -103,21 +103,10 @@ def run_scanner():
             time.sleep(300)
             continue
 
-        # 3. Check VIX kill switch
-        try:
-            if risk_manager.check_vix_kill_switch():
-                msg = "VIX > 30. Kill switch activated. Exiting without trading."
-                logging.warning(msg)
-                messages.append(msg)
-                time.sleep(300)
-                continue
-        except Exception as e:
-            logging.error(f"Error checking VIX kill switch: {e}")
-
         # Variables to track actions
         successful_trades = []
 
-        # 4. Manage Sells
+        # 3. Manage Sells
         try:
             positions = trading_client.get_all_positions()
 
@@ -193,6 +182,17 @@ def run_scanner():
                     logging.info(f"Holding {symbol} (PLPC: {unrealized_plpc:.2%}).")
         except Exception as e:
             logging.error(f"Error during sell management: {e}")
+
+        # 4. Check VIX kill switch
+        try:
+            if risk_manager.check_vix_kill_switch():
+                msg = "VIX > 30. Kill switch activated. Exiting without trading."
+                logging.warning(msg)
+                messages.append(msg)
+                time.sleep(300)
+                continue
+        except Exception as e:
+            logging.error(f"Error checking VIX kill switch: {e}")
 
         # 5. Scan for Buys
         tickers_to_scan = ['AAPL', 'AMZN', 'CAT', 'CL', 'GE', 'GOOGL', 'GS', 'JPM', 'LLY', 'META', 'MSFT', 'NOC', 'NVDA', 'RTX', 'UNH', 'WMT', 'XOM']
