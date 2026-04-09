@@ -91,6 +91,18 @@ def run_scanner():
         messages = []
         messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d')}\n")
 
+        # Log portfolio snapshot
+        try:
+            account = trading_client.get_account()
+            logging.info(
+                f"Portfolio | Value: ${float(account.portfolio_value):,.2f} | "
+                f"Cash: ${float(account.cash):,.2f} | "
+                f"Buying Power: ${float(account.buying_power):,.2f} | "
+                f"Equity: ${float(account.equity):,.2f}"
+            )
+        except Exception as e:
+            logging.error(f"Failed to log portfolio snapshot: {e}")
+
         # 2. Check if market is open
         try:
             clock = trading_client.get_clock()
@@ -186,7 +198,7 @@ def run_scanner():
         # 4. Check VIX kill switch
         try:
             if risk_manager.check_vix_kill_switch():
-                msg = "VIX > 30. Kill switch activated. Exiting without trading."
+                msg = "VIX > 35. Kill switch activated. Exiting without trading."
                 logging.warning(msg)
                 messages.append(msg)
                 time.sleep(300)

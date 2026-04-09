@@ -7,7 +7,7 @@ def check_vix_kill_switch():
     try:
         vix = yf.Ticker("^VIX")
         current_price = vix.history(period="1d")['Close'].iloc[-1]
-        if current_price > 30:
+        if current_price > 35:
             return True
         else:
             return False
@@ -22,7 +22,7 @@ def check_vix_kill_switch():
                 data = json.loads(response.read().decode('utf-8'))
                 current_price = data['chart']['result'][0]['meta']['regularMarketPrice']
             logging.info(f"Backup VIX sensor reading: {current_price}")
-            if current_price > 30:
+            if current_price > 35:
                 return True
             else:
                 return False
