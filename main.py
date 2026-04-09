@@ -79,6 +79,19 @@ def run_scanner():
 
         if gc:
             sheet = gc.open('Aegis Trading Log').sheet1
+            # Ensure headers are set
+            expected_headers = [
+                "Date/Time", "Ticker", "Action", "Price", "Shares",
+                "Total Value", "Reason", "RSI", "VIX Level",
+                "Portfolio Value", "P&L", "Result"
+            ]
+            try:
+                current_headers = sheet.row_values(1)
+                if current_headers != expected_headers:
+                    sheet.update('A1:L1', [expected_headers])
+                    logging.info("Google Sheets headers updated.")
+            except Exception as e:
+                logging.error(f"Failed to update sheet headers: {e}")
             logging.info("Google Sheets initialized.")
         else:
             sheet = None
@@ -161,11 +174,17 @@ def run_scanner():
                     reason = "Take Profit" if unrealized_plpc >= 0.10 else "Stop Loss"
                     logging.info(f"Triggering {reason} for {symbol} (PLPC: {unrealized_plpc:.2%}).")
                     try:
+                        sell_qty = float(position.qty)
+                        avg_entry_price = float(position.avg_entry_price)
+                        sell_rsi = strategy.get_current_rsi(data_client, symbol)
+                        sell_vix = risk_manager.get_vix_level()
+                        sell_portfolio_value = float(trading_client.get_account().portfolio_value)
+
                         if unrealized_plpc >= 0.10:
                             snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
                             current_price = snapshot.latest_trade.price
                             limit_price = round(current_price * 0.995, 2)
-                            
+
                             order_data = LimitOrderRequest(
                                 symbol=symbol,
                                 qty=position.qty,
@@ -174,8 +193,12 @@ def run_scanner():
                                 limit_price=limit_price
                             )
                             trading_client.submit_order(order_data=order_data)
+                            sell_price = float(limit_price)
                             msg = f"SELL {position.qty} shares of {symbol} at limit ({reason})"
                         else:
+                            snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
+                            sell_price = float(snapshot.latest_trade.price)
+
                             order_data = MarketOrderRequest(
                                 symbol=symbol,
                                 qty=position.qty,
@@ -184,10 +207,22 @@ def run_scanner():
                             )
                             trading_client.submit_order(order_data=order_data)
                             msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
-                            
+
+                        total_value = round(sell_price * sell_qty, 2)
+                        pnl = round((sell_price - avg_entry_price) * sell_qty, 2)
+                        result = "Win" if pnl >= 0 else "Loss"
+
                         logging.info(msg)
                         messages.append(msg)
-                        successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "SELL", float(position.qty), reason])
+                        successful_trades.append([
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            symbol, "SELL", sell_price, sell_qty,
+                            total_value, reason,
+                            sell_rsi if sell_rsi is not None else "",
+                            sell_vix if sell_vix is not None else "",
+                            round(sell_portfolio_value, 2),
+                            pnl, result
+                        ])
                     except Exception as e:
                         logging.error(f"Failed to sell {symbol}: {e}")
                 else:
@@ -228,7 +263,7 @@ def run_scanner():
                             current_price = snapshot.latest_trade.price
                             limit_price = round(current_price * 1.005, 2)
                             qty = round(size_usd / current_price, 4)
-                            
+
                             order_data = LimitOrderRequest(
                                 symbol=ticker,
                                 qty=qty,
@@ -237,10 +272,25 @@ def run_scanner():
                                 limit_price=limit_price
                             )
                             trading_client.submit_order(order_data=order_data)
+
+                            buy_price = float(limit_price)
+                            total_value = round(buy_price * qty, 2)
+                            buy_rsi = strategy.get_current_rsi(data_client, ticker)
+                            buy_vix = risk_manager.get_vix_level()
+                            buy_portfolio_value = float(trading_client.get_account().portfolio_value)
+
                             msg = f"BUY {qty} shares of {ticker} at limit ${limit_price} (${size_usd:.2f} total)"
                             logging.info(msg)
                             messages.append(msg)
-                            successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "BUY", size_usd, "RSI Strategy"])
+                            successful_trades.append([
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                ticker, "BUY", buy_price, qty,
+                                total_value, "RSI Strategy",
+                                buy_rsi if buy_rsi is not None else "",
+                                buy_vix if buy_vix is not None else "",
+                                round(buy_portfolio_value, 2),
+                                "", ""
+                            ])
                         except Exception as e:
                             logging.error(f"Failed to buy {ticker}: {e}")
                     else:

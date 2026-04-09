@@ -3,6 +3,26 @@ import logging
 import urllib.request
 import json
 
+def get_vix_level():
+    """Returns the current VIX level as a float, or None on error."""
+    try:
+        vix = yf.Ticker("^VIX")
+        return round(float(vix.history(period="1d")['Close'].iloc[-1]), 2)
+    except Exception as e:
+        logging.warning(f"Failed to fetch VIX level: {e}")
+        try:
+            req = urllib.request.Request(
+                "https://query1.finance.yahoo.com/v8/finance/chart/^VIX",
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                return round(float(data['chart']['result'][0]['meta']['regularMarketPrice']), 2)
+        except Exception as e2:
+            logging.error(f"Backup VIX fetch also failed: {e2}")
+            return None
+
+
 def check_vix_kill_switch():
     try:
         vix = yf.Ticker("^VIX")

@@ -71,3 +71,33 @@ def check_rsi_buy_signal(data_client, symbol):
         # Handle any API connection errors or other exceptions
         print(f"Error computing indicators for {symbol}: {e}")
         return False
+
+
+def get_current_rsi(data_client, symbol):
+    """Returns the current 14-day RSI for the given symbol, or None on error."""
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=100)
+
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=start_date,
+            end=end_date,
+            feed=DataFeed.IEX
+        )
+        bars = data_client.get_stock_bars(req).df
+
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.xs(symbol, level=0)
+
+        if len(bars) < 14:
+            return None
+
+        close_prices = bars['close']
+        rsi_14 = ta.momentum.RSIIndicator(close=close_prices, window=14).rsi()
+        current_rsi = rsi_14.iloc[-1]
+        return round(float(current_rsi), 2) if not pd.isna(current_rsi) else None
+    except Exception as e:
+        print(f"Error computing RSI for {symbol}: {e}")
+        return None
