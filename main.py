@@ -83,12 +83,14 @@ def run_scanner():
             expected_headers = [
                 "Date/Time", "Ticker", "Action", "Price", "Shares",
                 "Total Value", "Reason", "RSI", "VIX Level",
-                "Portfolio Value", "P&L", "Result"
+                "Portfolio Value", "P&L", "Result",
+                "Market Direction", "Dist 20-SMA %", "Dist 50-SMA %",
+                "Consec Days RSI<50"
             ]
             try:
                 current_headers = sheet.row_values(1)
                 if current_headers != expected_headers:
-                    sheet.update('A1:L1', [expected_headers])
+                    sheet.update('A1:P1', [expected_headers])
                     logging.info("Google Sheets headers updated.")
             except Exception as e:
                 logging.error(f"Failed to update sheet headers: {e}")
@@ -127,6 +129,10 @@ def run_scanner():
             logging.error(f"Failed to check market status: {e}")
             time.sleep(300)
             continue
+
+        # Check SPY market direction
+        market_direction = strategy.get_spy_direction(data_client)
+        logging.info(f"Market Direction: {market_direction}")
 
         # Variables to track actions
         successful_trades = []
@@ -179,6 +185,7 @@ def run_scanner():
                         sell_rsi = strategy.get_current_rsi(data_client, symbol)
                         sell_vix = risk_manager.get_vix_level()
                         sell_portfolio_value = float(trading_client.get_account().portfolio_value)
+                        sell_ctx = strategy.get_market_context(data_client, symbol)
 
                         if unrealized_plpc >= 0.10:
                             snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
@@ -221,7 +228,11 @@ def run_scanner():
                             sell_rsi if sell_rsi is not None else "",
                             sell_vix if sell_vix is not None else "",
                             round(sell_portfolio_value, 2),
-                            pnl, result
+                            pnl, result,
+                            market_direction,
+                            sell_ctx['dist_sma_20'] if sell_ctx else "",
+                            sell_ctx['dist_sma_50'] if sell_ctx else "",
+                            sell_ctx['consecutive_rsi_below_50'] if sell_ctx else ""
                         ])
                     except Exception as e:
                         logging.error(f"Failed to sell {symbol}: {e}")
@@ -252,6 +263,14 @@ def run_scanner():
                 if ticker in owned_tickers:
                     logging.info(f"Already own {ticker}. Skipping buy check.")
                     continue
+
+                ticker_ctx = strategy.get_market_context(data_client, ticker)
+                if ticker_ctx:
+                    logging.info(
+                        f"Context for {ticker} | Dist 20-SMA: {ticker_ctx['dist_sma_20']:.2f}% | "
+                        f"Dist 50-SMA: {ticker_ctx['dist_sma_50']:.2f}% | "
+                        f"Consec RSI<50: {ticker_ctx['consecutive_rsi_below_50']}d"
+                    )
 
                 if strategy.check_rsi_buy_signal(data_client, ticker):
                     logging.info(f"Buy signal triggered for {ticker}.")
@@ -289,7 +308,11 @@ def run_scanner():
                                 buy_rsi if buy_rsi is not None else "",
                                 buy_vix if buy_vix is not None else "",
                                 round(buy_portfolio_value, 2),
-                                "", ""
+                                "", "",
+                                market_direction,
+                                ticker_ctx['dist_sma_20'] if ticker_ctx else "",
+                                ticker_ctx['dist_sma_50'] if ticker_ctx else "",
+                                ticker_ctx['consecutive_rsi_below_50'] if ticker_ctx else ""
                             ])
                         except Exception as e:
                             logging.error(f"Failed to buy {ticker}: {e}")

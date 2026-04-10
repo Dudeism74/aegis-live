@@ -10,37 +10,21 @@ class DummyAlpacaClient:
         self.data_type = data_type
 
     def get_bars(self, symbol, timeframe, start, end):
-        # We need at least 50 days of data for the 50-day SMA.
+        # We need at least 20 days of data for the 20-day SMA.
         # Let's provide 100 days of data to be safe.
 
         if self.data_type == 'bullish_oversold_bounce':
-            # Price > 50 SMA, RSI < 50, current > previous
-            closes = [10] * 80
-            closes += [10000] * 20
-            for i in range(11):
-                closes.append(10000 - i * 300)
-            closes.append(7300)
+            # Price > 20 SMA, RSI < 55, current > previous
+            closes = [100] * 94 + [124, 117, 112, 107, 102, 104]
         elif self.data_type == 'bullish_oversold_falling':
-            # Price > 50 SMA, RSI < 50, current <= previous
-            closes = [10] * 80
-            closes += [10000] * 18
-            for i in range(11):
-                closes.append(10000 - i * 300)
-            closes.append(6900)
+            # Price > 20 SMA, RSI < 55, current <= previous
+            closes = [100] * 94 + [124, 117, 112, 107, 106, 105]
         elif self.data_type == 'bearish_oversold_bounce':
-            # Price <= 50 SMA, RSI < 50, current > previous
-            closes = [10000] * 80
-            closes += [10000] * 20
-            for i in range(11):
-                closes.append(10000 - i * 300)
-            closes.append(7100)
+            # Price <= 20 SMA, RSI < 55, current > previous
+            closes = [200] * 94 + [195, 185, 175, 165, 155, 157]
         elif self.data_type == 'bullish_normal':
-            # Price > 50 SMA, RSI >= 50, current > previous
-            closes = [10] * 80
-            closes += [10000] * 20
-            for i in range(11):
-                closes.append(10000 - i * 100)
-            closes.append(9200)
+            # Price > 20 SMA, RSI >= 55, current > previous
+            closes = [100] * 94 + [110, 115, 120, 125, 128, 130]
         elif self.data_type == 'too_short':
             closes = [100, 101, 102]
         else:
