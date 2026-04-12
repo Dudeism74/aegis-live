@@ -187,3 +187,47 @@ def get_spy_direction(data_client):
     except Exception as e:
         print(f"Error computing SPY direction: {e}")
         return 'UNKNOWN'
+
+
+def get_signal_details(data_client, symbol):
+    """Returns detailed buy signal conditions for daily recap analysis."""
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=100)
+
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=start_date,
+            end=end_date,
+            feed=DataFeed.IEX
+        )
+        bars = data_client.get_stock_bars(req).df
+
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.xs(symbol, level=0)
+
+        if len(bars) < 20:
+            return None
+
+        close_prices = bars['close']
+        sma_20 = ta.trend.SMAIndicator(close=close_prices, window=20).sma_indicator()
+        rsi_14 = ta.momentum.RSIIndicator(close=close_prices, window=14).rsi()
+
+        current_price = close_prices.iloc[-1]
+        previous_price = close_prices.iloc[-2]
+        current_sma = sma_20.iloc[-1]
+        current_rsi = rsi_14.iloc[-1]
+
+        if pd.isna(current_sma) or pd.isna(current_rsi):
+            return None
+
+        return {
+            'rsi': round(float(current_rsi), 2),
+            'above_sma_20': bool(current_price > current_sma),
+            'above_prev_close': bool(current_price > previous_price),
+            'is_buy': bool(current_price > current_sma and current_rsi < 55 and current_price > previous_price)
+        }
+    except Exception as e:
+        print(f"Error computing signal details for {symbol}: {e}")
+        return None

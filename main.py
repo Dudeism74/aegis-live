@@ -56,6 +56,78 @@ def send_email(subject, body):
     except Exception as e:
         logging.error(f"Failed to send email: {e}")
 
+def write_daily_recap(gc, data_client, market_direction, daily_trade_count, tickers_to_scan):
+    """Write a daily recap row to the 'Daily Recap' tab after market close."""
+    try:
+        spreadsheet = gc.open('Aegis Trading Log')
+
+        # Get or create the Daily Recap tab
+        try:
+            recap_sheet = spreadsheet.worksheet('Daily Recap')
+        except gspread.exceptions.WorksheetNotFound:
+            recap_sheet = spreadsheet.add_worksheet(title='Daily Recap', rows=1000, cols=8)
+            headers = [
+                "Date", "Market Direction", "VIX Level", "Trades Executed",
+                "Closest to Buy", "Reason Not Triggered",
+                "SMA-Blocked Tickers", "Avg RSI (All 17)"
+            ]
+            recap_sheet.update('A1:H1', [headers])
+            logging.info("Created 'Daily Recap' tab with headers.")
+
+        vix_level = risk_manager.get_vix_level()
+
+        all_rsi = []
+        near_misses = []
+        sma_blocked = []
+
+        for ticker in tickers_to_scan:
+            details = strategy.get_signal_details(data_client, ticker)
+            if details is None:
+                continue
+
+            all_rsi.append(details['rsi'])
+
+            if details['rsi'] < 55 and not details['is_buy']:
+                if not details['above_sma_20']:
+                    reason = "below 20-SMA"
+                    sma_blocked.append(ticker)
+                else:
+                    reason = "below previous close"
+                near_misses.append((ticker, details['rsi'], reason))
+
+        closest_ticker = ""
+        closest_reason = ""
+        if near_misses:
+            near_misses.sort(key=lambda x: x[1])
+            closest_ticker = f"{near_misses[0][0]} (RSI: {near_misses[0][1]})"
+            closest_reason = near_misses[0][2]
+
+        avg_rsi = round(sum(all_rsi) / len(all_rsi), 2) if all_rsi else ""
+        sma_blocked_str = ", ".join(sma_blocked) if sma_blocked else ""
+
+        try:
+            ny_tz = zoneinfo.ZoneInfo("America/New_York")
+        except Exception:
+            ny_tz = timezone.utc
+        today_str = datetime.now(ny_tz).strftime("%Y-%m-%d")
+
+        row = [
+            today_str,
+            market_direction,
+            vix_level if vix_level is not None else "",
+            daily_trade_count,
+            closest_ticker,
+            closest_reason,
+            sma_blocked_str,
+            avg_rsi
+        ]
+
+        recap_sheet.append_row(row)
+        logging.info("Daily recap written to Google Sheets.")
+    except Exception as e:
+        logging.error(f"Failed to write daily recap: {e}")
+
+
 def run_scanner():
     # 1. Initialize Alpaca trading client, gspread
     try:
@@ -102,7 +174,30 @@ def run_scanner():
         logging.error(f"Failed to initialize gspread: {e}")
         sheet = None
 
+    # Ticker universe (constant)
+    tickers_to_scan = ['AAPL', 'AMZN', 'CAT', 'CL', 'GE', 'GOOGL', 'GS', 'JPM', 'LLY', 'META', 'MSFT', 'NOC', 'NVDA', 'RTX', 'UNH', 'WMT', 'XOM']
+
+    # Daily recap tracking
+    daily_trade_count = 0
+    recap_written_date = None
+    market_open_today = False
+    last_market_direction = "UNKNOWN"
+    current_tracking_date = None
+
     while True:
+        # Track date transitions for daily reset
+        try:
+            ny_tz = zoneinfo.ZoneInfo("America/New_York")
+        except Exception:
+            ny_tz = timezone.utc
+        now_ny = datetime.now(ny_tz)
+        today_date = now_ny.date()
+        if current_tracking_date != today_date:
+            current_tracking_date = today_date
+            daily_trade_count = 0
+            market_open_today = False
+            last_market_direction = "UNKNOWN"
+
         messages = []
         messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d')}\n")
 
@@ -122,6 +217,16 @@ def run_scanner():
         try:
             clock = trading_client.get_clock()
             if not clock.is_open:
+                # Check for daily recap at 4:05 PM ET
+                recap_time = now_ny.replace(hour=16, minute=5, second=0, microsecond=0)
+                if (market_open_today
+                        and now_ny >= recap_time
+                        and recap_written_date != today_date
+                        and gc):
+                    write_daily_recap(gc, data_client, last_market_direction,
+                                     daily_trade_count, tickers_to_scan)
+                    recap_written_date = today_date
+
                 logging.info("Market Closed - Sleeping")
                 time.sleep(300)
                 continue
@@ -130,8 +235,11 @@ def run_scanner():
             time.sleep(300)
             continue
 
+        market_open_today = True
+
         # Check SPY market direction
         market_direction = strategy.get_spy_direction(data_client)
+        last_market_direction = market_direction
         logging.info(f"Market Direction: {market_direction}")
 
         # Variables to track actions
@@ -253,8 +361,6 @@ def run_scanner():
             logging.error(f"Error checking VIX kill switch: {e}")
 
         # 5. Scan for Buys
-        tickers_to_scan = ['AAPL', 'AMZN', 'CAT', 'CL', 'GE', 'GOOGL', 'GS', 'JPM', 'LLY', 'META', 'MSFT', 'NOC', 'NVDA', 'RTX', 'UNH', 'WMT', 'XOM']
-
         try:
             positions = trading_client.get_all_positions()
             owned_tickers = {p.symbol for p in positions}
@@ -331,6 +437,8 @@ def run_scanner():
                 logging.info("Trades logged to Google Sheets.")
         except Exception as e:
             logging.error(f"Failed to log to Google Sheets: {e}")
+
+        daily_trade_count += len(successful_trades)
 
         if successful_trades:
             compiled_string = "\n".join(messages)
