@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -15,6 +16,9 @@ def check_rsi_buy_signal(data_client, symbol):
     3) Current price > previous day's close (bounce confirmation)
     """
     try:
+        # Rate Limit Bypass
+        time.sleep(1.5)
+
         # We need at least 200 trading days for the 200-day SMA.
         # Fetching 400 calendar days ensures we have enough data.
         end_date = datetime.now()
