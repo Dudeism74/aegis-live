@@ -103,6 +103,10 @@ def run_scanner():
             time.sleep(300)
             continue
 
+        # Fetch global metrics
+        current_vix = risk_manager.get_vix()
+        market_direction = risk_manager.get_market_direction()
+
         # Variables to track actions
         successful_trades = []
 
@@ -149,9 +153,10 @@ def run_scanner():
                     reason = "Take Profit" if unrealized_plpc >= 0.05 else "Stop Loss"
                     logging.info(f"Triggering {reason} for {symbol} (PLPC: {unrealized_plpc:.2%}).")
                     try:
+                        snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
+                        current_price = snapshot.latest_trade.price
+
                         if unrealized_plpc >= 0.05:
-                            snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
-                            current_price = snapshot.latest_trade.price
                             limit_price = round(current_price * 0.995, 2)
                             
                             order_data = LimitOrderRequest(
@@ -175,7 +180,31 @@ def run_scanner():
                             
                         logging.info(msg)
                         messages.append(msg)
-                        successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "SELL", float(position.qty), reason])
+
+                        # Fetch indicator data for logging
+                        indic = strategy.check_rsi_buy_signal(data_client, symbol)
+                        sell_rsi = indic["rsi"] if indic else "N/A"
+                        sell_dist = f"{indic['dist_200_sma']*100:.2f}%" if indic else "N/A"
+                        sell_status = indic["rsi_status"] if indic else "N/A"
+                        port_val = float(trading_client.get_account().portfolio_value)
+
+                        successful_trades.append([
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            symbol,
+                            "SELL",
+                            round(current_price, 2),
+                            float(position.qty),
+                            round(float(position.qty) * current_price, 2),
+                            reason,
+                            round(sell_rsi, 2) if isinstance(sell_rsi, float) else sell_rsi,
+                            round(current_vix, 2),
+                            round(port_val, 2),
+                            f"{unrealized_plpc*100:.2f}%",
+                            "WIN" if unrealized_plpc > 0 else "LOSS",
+                            market_direction,
+                            sell_dist,
+                            sell_status
+                        ])
                     except Exception as e:
                         logging.error(f"Failed to sell {symbol}: {e}")
                 else:
@@ -197,16 +226,37 @@ def run_scanner():
         # 5. Scan for Buys
         tickers_to_scan = ['TSLA', 'NVDA', 'AMD', 'PLTR', 'COIN', 'MSTR', 'SMCI', 'CRWD', 'SNOW', 'SHOP', 'ROKU', 'SQ', 'META', 'NFLX', 'AMZN', 'UBER', 'DASH']
 
+        recap_rsi_list = []
+        recap_blocked = []
+        closest_rsi = 999
+        closest_ticker = "None"
+        reason_no_buy = "N/A"
+
         try:
             positions = trading_client.get_all_positions()
             owned_tickers = {p.symbol for p in positions}
 
             for ticker in tickers_to_scan:
+                indic = strategy.check_rsi_buy_signal(data_client, ticker)
+                if not indic: continue
+
+                rsi_val = indic["rsi"]
+                recap_rsi_list.append(rsi_val)
+                if not indic["above_200_sma"]:
+                    recap_blocked.append(ticker)
+                
+                if not indic["is_buy"] and rsi_val < closest_rsi:
+                    closest_rsi = rsi_val
+                    closest_ticker = ticker
+                    if not indic["above_200_sma"]: reason_no_buy = "Below 200-SMA"
+                    elif not indic["rsi_status"]: reason_no_buy = "RSI >= 40"
+                    elif not indic["price_bounced"]: reason_no_buy = "No Price Bounce"
+
                 if ticker in owned_tickers:
                     logging.info(f"Already own {ticker}. Skipping buy check.")
                     continue
 
-                if strategy.check_rsi_buy_signal(data_client, ticker):
+                if indic["is_buy"]:
                     logging.info(f"Buy signal triggered for {ticker}.")
                     size_usd = portfolio.calculate_position_size(trading_client)
 
@@ -228,7 +278,25 @@ def run_scanner():
                             msg = f"BUY {qty} shares of {ticker} at limit ${limit_price} (${size_usd:.2f} total)"
                             logging.info(msg)
                             messages.append(msg)
-                            successful_trades.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticker, "BUY", size_usd, "RSI Strategy"])
+                            
+                            port_val = float(trading_client.get_account().portfolio_value)
+                            successful_trades.append([
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                ticker,
+                                "BUY",
+                                round(current_price, 2),
+                                qty,
+                                round(size_usd, 2),
+                                "RSI Strategy",
+                                round(rsi_val, 2),
+                                round(current_vix, 2),
+                                round(port_val, 2),
+                                "0.00%",
+                                "",
+                                market_direction,
+                                f"{indic['dist_200_sma']*100:.2f}%",
+                                indic["rsi_status"]
+                            ])
                         except Exception as e:
                             logging.error(f"Failed to buy {ticker}: {e}")
                     else:
@@ -240,10 +308,30 @@ def run_scanner():
 
         # 6. Wrap up
         try:
-            if sheet and successful_trades:
-                for trade in successful_trades:
-                    sheet.append_row(trade)
-                logging.info("Trades logged to Google Sheets.")
+            if gc:
+                if successful_trades:
+                    sheet1 = gc.open('Aegis Trading Log').sheet1
+                    for trade in successful_trades:
+                        sheet1.append_row(trade)
+                    logging.info("Individual trades logged to Google Sheets.")
+                
+                try:
+                    recap_sheet = gc.open('Aegis Trading Log').worksheet("Daily Recap")
+                    avg_rsi = sum(recap_rsi_list) / len(recap_rsi_list) if recap_rsi_list else 0
+                    recap_payload = [
+                        datetime.now().strftime('%Y-%m-%d'),
+                        market_direction,
+                        round(current_vix, 2),
+                        len(successful_trades),
+                        f"{closest_ticker} ({round(closest_rsi, 2)})" if closest_ticker != "None" else "None",
+                        reason_no_buy,
+                        ", ".join(recap_blocked),
+                        round(avg_rsi, 2)
+                    ]
+                    recap_sheet.append_row(recap_payload)
+                    logging.info("Daily Recap logged to Google Sheets.")
+                except Exception as e:
+                    logging.error(f"Failed to log Daily Recap: {e}")
         except Exception as e:
             logging.error(f"Failed to log to Google Sheets: {e}")
 

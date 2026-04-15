@@ -61,7 +61,10 @@ def check_rsi_buy_signal(data_client, symbol):
         # 1) Current price > 200-day SMA
         # 2) 14-day RSI < 40
         # 3) Current price > previous day's close
-        is_buy = current_price > current_sma and current_rsi < 40 and current_price > previous_price
+        rsi_status = current_rsi < 40
+        above_200_sma = current_price > current_sma
+        price_bounced = current_price > previous_price
+        is_buy = above_200_sma and rsi_status and price_bounced
 
         import logging
         if is_buy:
@@ -69,9 +72,16 @@ def check_rsi_buy_signal(data_client, symbol):
         else:
             logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: HOLD (Threshold: < 40)")
 
-        return is_buy
+        return {
+            "is_buy": is_buy,
+            "rsi": float(current_rsi),
+            "dist_200_sma": float((current_price - current_sma) / current_sma),
+            "rsi_status": rsi_status,
+            "above_200_sma": above_200_sma,
+            "price_bounced": price_bounced
+        }
 
     except Exception as e:
         # Handle any API connection errors or other exceptions
         print(f"Error computing indicators for {symbol}: {e}")
-        return False
+        return None
