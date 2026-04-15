@@ -8,17 +8,17 @@ from alpaca.data.enums import DataFeed
 
 def check_rsi_buy_signal(data_client, symbol):
     """
-    Fetches the last 100 days of daily closing prices for the given symbol,
-    calculates the 50-day SMA and 14-day RSI. Returns True ONLY if:
-    1) Current price is > 50-day SMA
-    2) 14-day RSI is < 50
+    Fetches the last 400 days of daily closing prices for the given symbol,
+    calculates the 200-day SMA and 14-day RSI. Returns True ONLY if:
+    1) Current price is > 200-day SMA
+    2) 14-day RSI is < 40
     3) Current price > previous day's close (bounce confirmation)
     """
     try:
-        # We need at least 50 trading days for the 50-day SMA.
-        # Fetching 100 calendar days ensures we have enough data.
+        # We need at least 200 trading days for the 200-day SMA.
+        # Fetching 400 calendar days ensures we have enough data.
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=100)
+        start_date = end_date - timedelta(days=400)
 
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
@@ -32,21 +32,21 @@ def check_rsi_buy_signal(data_client, symbol):
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.xs(symbol, level=0)
 
-        # We need at least 50 days of data to compute a 50-day SMA
-        if len(bars) < 50:
+        # We need at least 200 days of data to compute a 200-day SMA
+        if len(bars) < 200:
             return False
 
         close_prices = bars['close']
 
-        # Calculate 50-day SMA using ta library
-        sma_50 = ta.trend.SMAIndicator(close=close_prices, window=50).sma_indicator()
+        # Calculate 200-day SMA using ta library
+        sma_200 = ta.trend.SMAIndicator(close=close_prices, window=200).sma_indicator()
 
         # Calculate 14-day RSI using ta library
         rsi_14 = ta.momentum.RSIIndicator(close=close_prices, window=14).rsi()
 
         current_price = close_prices.iloc[-1]
         previous_price = close_prices.iloc[-2]
-        current_sma = sma_50.iloc[-1]
+        current_sma = sma_200.iloc[-1]
         current_rsi = rsi_14.iloc[-1]
 
         # Handle edge cases where values might be NaN
@@ -54,16 +54,16 @@ def check_rsi_buy_signal(data_client, symbol):
             return False
 
         # Evaluate the conditions:
-        # 1) Current price > 50-day SMA
-        # 2) 14-day RSI < 50
+        # 1) Current price > 200-day SMA
+        # 2) 14-day RSI < 40
         # 3) Current price > previous day's close
-        is_buy = current_price > current_sma and current_rsi < 50 and current_price > previous_price
+        is_buy = current_price > current_sma and current_rsi < 40 and current_price > previous_price
 
         import logging
         if is_buy:
-            logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: BUY (Threshold: < 50)")
+            logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: BUY (Threshold: < 40)")
         else:
-            logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: HOLD (Threshold: < 50)")
+            logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: HOLD (Threshold: < 40)")
 
         return is_buy
 

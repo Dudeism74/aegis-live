@@ -145,11 +145,11 @@ def run_scanner():
 
                 unrealized_plpc = float(position.unrealized_plpc)
 
-                if unrealized_plpc >= 0.10 or unrealized_plpc <= -0.05:
-                    reason = "Take Profit" if unrealized_plpc >= 0.10 else "Stop Loss"
+                if unrealized_plpc >= 0.05 or unrealized_plpc <= -0.025:
+                    reason = "Take Profit" if unrealized_plpc >= 0.05 else "Stop Loss"
                     logging.info(f"Triggering {reason} for {symbol} (PLPC: {unrealized_plpc:.2%}).")
                     try:
-                        if unrealized_plpc >= 0.10:
+                        if unrealized_plpc >= 0.05:
                             snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
                             current_price = snapshot.latest_trade.price
                             limit_price = round(current_price * 0.995, 2)
@@ -195,7 +195,7 @@ def run_scanner():
             logging.error(f"Error checking VIX kill switch: {e}")
 
         # 5. Scan for Buys
-        tickers_to_scan = ['AAPL', 'AMZN', 'CAT', 'CL', 'GE', 'GOOGL', 'GS', 'JPM', 'LLY', 'META', 'MSFT', 'NOC', 'NVDA', 'RTX', 'UNH', 'WMT', 'XOM']
+        tickers_to_scan = ['TSLA', 'NVDA', 'AMD', 'PLTR', 'COIN', 'MSTR', 'SMCI', 'CRWD', 'SNOW', 'SHOP', 'ROKU', 'SQ', 'META', 'NFLX', 'AMZN', 'UBER', 'DASH']
 
         try:
             positions = trading_client.get_all_positions()
