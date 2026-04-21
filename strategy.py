@@ -1,87 +1,111 @@
 import time
+import logging
 from datetime import datetime, timedelta
+
 import pandas as pd
-import numpy as np
 import ta
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, Adjustment
+
 
 def check_rsi_buy_signal(data_client, symbol):
     """
-    Fetches the last 400 days of daily closing prices for the given symbol,
-    calculates the 200-day SMA and 14-day RSI. Returns True ONLY if:
-    1) Current price is > 200-day SMA
-    2) 14-day RSI is < 40
-    3) Current price > previous day's close (bounce confirmation)
+    Fetches 150 calendar days of split/dividend-adjusted daily bars for `symbol`,
+    then evaluates three indicators:
+
+      KAMA(21, fast=2, slow=30)   — macro trend filter
+      BB-RSI(7 / SMA-14 / STD-14) — dynamic momentum band
+      ATR(14)                      — volatility base for position sizing
+
+    BUY signal requires ALL three gates simultaneously:
+      1. Close > KAMA          (trend intact)
+      2. RSI_7 < Lower Band    (statistically oversold)
+      3. Close > Open          (intraday bounce confirmation)
+
+    Returns dict: {is_buy, rsi_7, lower_band, atr_14}
+    Returns None on insufficient data or unrecoverable error.
     """
     try:
-        # Rate Limit Bypass
-        time.sleep(1.5)
+        time.sleep(1.5)  # rate-limit courtesy delay
 
-        # We need at least 200 trading days for the 200-day SMA.
-        # Fetching 400 calendar days ensures we have enough data.
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=400)
+        start_date = end_date - timedelta(days=150)
 
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame.Day,
             start=start_date,
             end=end_date,
-            feed=DataFeed.IEX
+            feed=DataFeed.IEX,
+            adjustment=Adjustment.ALL
         )
         bars = data_client.get_stock_bars(req).df
 
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.xs(symbol, level=0)
 
-        # We need at least 200 days of data to compute a 200-day SMA
-        if len(bars) < 200:
-            return False
+        if len(bars) < 30:
+            logging.warning(f"{symbol}: only {len(bars)} bars returned — insufficient for indicators.")
+            return None
 
-        close_prices = bars['close']
+        close = bars['close']
+        high  = bars['high']
+        low   = bars['low']
+        open_ = bars['open']
 
-        # Calculate 200-day SMA using ta library
-        sma_200 = ta.trend.SMAIndicator(close=close_prices, window=200).sma_indicator()
+        # --- Indicator 1: KAMA(21, fast=2, slow=30) ---
+        kama = ta.momentum.KAMAIndicator(close=close, window=21, pow1=2, pow2=30).kama()
 
-        # Calculate 14-day RSI using ta library
-        rsi_14 = ta.momentum.RSIIndicator(close=close_prices, window=14).rsi()
+        # --- Indicator 2: BB-RSI ---
+        rsi_7      = ta.momentum.RSIIndicator(close=close, window=7).rsi()
+        rsi_sma    = rsi_7.rolling(window=14).mean()
+        rsi_std    = rsi_7.rolling(window=14).std()
+        lower_band = rsi_sma - (1.25 * rsi_std)
 
-        current_price = close_prices.iloc[-1]
-        previous_price = close_prices.iloc[-2]
-        current_sma = sma_200.iloc[-1]
-        current_rsi = rsi_14.iloc[-1]
+        # --- Indicator 3: ATR(14) ---
+        atr_14 = ta.volatility.AverageTrueRange(
+            high=high, low=low, close=close, window=14
+        ).average_true_range()
 
-        # Handle edge cases where values might be NaN
-        if pd.isna(current_sma) or pd.isna(current_rsi):
-            return False
+        current_close      = close.iloc[-1]
+        current_open       = open_.iloc[-1]
+        current_kama       = kama.iloc[-1]
+        current_rsi_7      = rsi_7.iloc[-1]
+        current_lower_band = lower_band.iloc[-1]
+        current_atr        = atr_14.iloc[-1]
 
-        # Evaluate the conditions:
-        # 1) Current price > 200-day SMA
-        # 2) 14-day RSI < 40
-        # 3) Current price > previous day's close
-        rsi_status = current_rsi < 40
-        above_200_sma = current_price > current_sma
-        price_bounced = current_price > previous_price
-        is_buy = above_200_sma and rsi_status and price_bounced
+        if any(
+            pd.isna(v)
+            for v in [current_kama, current_rsi_7, current_lower_band, current_atr]
+        ):
+            logging.warning(f"{symbol}: NaN in one or more indicators — skipping.")
+            return None
 
-        import logging
+        # --- Logic Gates ---
+        above_kama      = current_close > current_kama
+        rsi_oversold    = current_rsi_7 < current_lower_band
+        intraday_bounce = current_close > current_open
+        is_buy          = above_kama and rsi_oversold and intraday_bounce
+
         if is_buy:
-            logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: BUY (Threshold: < 40)")
+            logging.info(
+                f"{symbol} | BUY  | Close={current_close:.2f}  KAMA={current_kama:.2f}  "
+                f"RSI_7={current_rsi_7:.2f}  LowerBand={current_lower_band:.2f}  ATR={current_atr:.2f}"
+            )
         else:
-            logging.info(f"Ticker: {symbol} | Current RSI: {current_rsi:.1f} | Action: HOLD (Threshold: < 40)")
+            logging.info(
+                f"{symbol} | HOLD | above_kama={above_kama}  rsi_oversold={rsi_oversold}  "
+                f"bounce={intraday_bounce} | RSI_7={current_rsi_7:.2f}  LowerBand={current_lower_band:.2f}"
+            )
 
         return {
-            "is_buy": is_buy,
-            "rsi": float(current_rsi),
-            "dist_200_sma": float((current_price - current_sma) / current_sma),
-            "rsi_status": rsi_status,
-            "above_200_sma": above_200_sma,
-            "price_bounced": price_bounced
+            "is_buy":     is_buy,
+            "rsi_7":      float(current_rsi_7),
+            "lower_band": float(current_lower_band),
+            "atr_14":     float(current_atr),
         }
 
     except Exception as e:
-        # Handle any API connection errors or other exceptions
-        print(f"Error computing indicators for {symbol}: {e}")
+        logging.error(f"Error computing indicators for {symbol}: {e}")
         return None

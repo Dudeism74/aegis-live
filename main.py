@@ -14,7 +14,7 @@ except ImportError:
     from backports import zoneinfo
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
@@ -27,8 +27,8 @@ from dotenv import load_dotenv
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 load_dotenv(dotenv_path=env_path)
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 def send_email(subject, body):
     sender_email = os.environ.get("SENDER_EMAIL")
@@ -49,15 +49,15 @@ def send_email(subject, body):
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(sender_email, sender_password)
-        text = msg.as_string()
-        server.sendmail(sender_email, recipient_email, text)
+        server.sendmail(sender_email, recipient_email, msg.as_string())
         server.quit()
         logging.info("Email sent successfully.")
     except Exception as e:
         logging.error(f"Failed to send email: {e}")
 
+
 def run_scanner():
-    # 1. Initialize Alpaca trading client, gspread
+    # 1. Initialize clients
     try:
         api_key = os.environ.get("APCA_API_KEY_ID", "dummy_key")
         api_secret = os.environ.get("APCA_API_SECRET_KEY", "dummy_secret")
@@ -67,29 +67,24 @@ def run_scanner():
     except Exception as e:
         msg = f"Failed to initialize Alpaca Clients: {e}"
         logging.error(msg)
-        messages = [msg]
-        send_email("Aegis Trading Error", "\n".join(messages))
+        send_email("Aegis Trading Error", msg)
         sys.exit(1)
 
     try:
-        # Initialize Google Sheets
         gc = None
         cred_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
         gc = gspread.service_account(filename=cred_path)
-
         if gc:
-            sheet = gc.open('Aegis Trading Log').sheet1
             logging.info("Google Sheets initialized.")
         else:
-            sheet = None
             logging.warning("Google Sheets credentials not found. Logging to sheets disabled.")
     except Exception as e:
         logging.error(f"Failed to initialize gspread: {e}")
-        sheet = None
+        gc = None
 
     while True:
         messages = []
-        messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d')}\n")
+        messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
         # 2. Check if market is open
         try:
@@ -107,25 +102,19 @@ def run_scanner():
         current_vix = risk_manager.get_vix()
         market_direction = risk_manager.get_market_direction()
 
-        # Variables to track actions
         successful_trades = []
 
-        # 3. Manage Sells
+        # 3. Manage Sells — dynamic ATR exits
         try:
             positions = trading_client.get_all_positions()
 
-            # Get today's filled orders for PDT shield
-            # Use US/Eastern time for PDT calculation
             try:
                 ny_tz = zoneinfo.ZoneInfo("America/New_York")
             except Exception:
-                # Fallback if zoneinfo is not available or tzdata is missing
                 ny_tz = timezone.utc
 
             now_ny = datetime.now(ny_tz)
             today_ny = now_ny.replace(hour=0, minute=0, second=0, microsecond=0)
-
-            # Alpaca API expects UTC for timestamps
             today_utc = today_ny.astimezone(timezone.utc)
 
             req = GetOrdersRequest(
@@ -135,7 +124,6 @@ def run_scanner():
             )
             recent_orders = trading_client.get_orders(req)
 
-            # Identify tickers bought today
             bought_today = set()
             for order in recent_orders:
                 if order.side == OrderSide.BUY and order.filled_at and order.filled_at >= today_utc:
@@ -147,45 +135,49 @@ def run_scanner():
                     logging.info(f"PDT Shield: {symbol} was bought today. Skipping sell check.")
                     continue
 
-                unrealized_plpc = float(position.unrealized_plpc)
+                # Fetch current indicators to get ATR-based thresholds
+                indic = strategy.check_rsi_buy_signal(data_client, symbol)
+                if not indic:
+                    logging.warning(f"Could not fetch indicators for {symbol}. Skipping sell check.")
+                    continue
 
-                if unrealized_plpc >= 0.05 or unrealized_plpc <= -0.025:
-                    reason = "Take Profit" if unrealized_plpc >= 0.05 else "Stop Loss"
-                    logging.info(f"Triggering {reason} for {symbol} (PLPC: {unrealized_plpc:.2%}).")
+                atr_14 = indic["atr_14"]
+                avg_entry_price = float(position.avg_entry_price)
+                take_profit_threshold = avg_entry_price + (3.0 * atr_14)
+                stop_loss_threshold  = avg_entry_price - (2.0 * atr_14)
+
+                try:
+                    snapshot = data_client.get_stock_snapshot(
+                        StockSnapshotRequest(symbol_or_symbols=symbol)
+                    )[symbol]
+                    current_price = snapshot.latest_trade.price
+                except Exception as e:
+                    logging.error(f"Failed to fetch snapshot for {symbol}: {e}")
+                    continue
+
+                take_profit = current_price >= take_profit_threshold
+                stop_loss   = current_price <= stop_loss_threshold
+
+                if take_profit or stop_loss:
+                    reason = "Take Profit (3×ATR)" if take_profit else "Stop Loss (2×ATR)"
+                    logging.info(
+                        f"Triggering {reason} for {symbol} | "
+                        f"Entry={avg_entry_price:.2f}  Current={current_price:.2f}  ATR={atr_14:.2f}  "
+                        f"TP={take_profit_threshold:.2f}  SL={stop_loss_threshold:.2f}"
+                    )
                     try:
-                        snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
-                        current_price = snapshot.latest_trade.price
-
-                        if unrealized_plpc >= 0.05:
-                            limit_price = round(current_price * 0.995, 2)
-                            
-                            order_data = LimitOrderRequest(
-                                symbol=symbol,
-                                qty=position.qty,
-                                side=OrderSide.SELL,
-                                time_in_force=TimeInForce.DAY,
-                                limit_price=limit_price
-                            )
-                            trading_client.submit_order(order_data=order_data)
-                            msg = f"SELL {position.qty} shares of {symbol} at limit ({reason})"
-                        else:
-                            order_data = MarketOrderRequest(
-                                symbol=symbol,
-                                qty=position.qty,
-                                side=OrderSide.SELL,
-                                time_in_force=TimeInForce.DAY
-                            )
-                            trading_client.submit_order(order_data=order_data)
-                            msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
-                            
+                        order_data = MarketOrderRequest(
+                            symbol=symbol,
+                            qty=position.qty,
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.DAY
+                        )
+                        trading_client.submit_order(order_data=order_data)
+                        msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
                         logging.info(msg)
                         messages.append(msg)
 
-                        # Fetch indicator data for logging
-                        indic = strategy.check_rsi_buy_signal(data_client, symbol)
-                        sell_rsi = indic["rsi"] if indic else "N/A"
-                        sell_dist = f"{indic['dist_200_sma']*100:.2f}%" if indic else "N/A"
-                        sell_status = indic["rsi_status"] if indic else "N/A"
+                        unrealized_plpc = float(position.unrealized_plpc)
                         port_val = float(trading_client.get_account().portfolio_value)
 
                         successful_trades.append([
@@ -196,26 +188,29 @@ def run_scanner():
                             float(position.qty),
                             round(float(position.qty) * current_price, 2),
                             reason,
-                            round(sell_rsi, 2) if isinstance(sell_rsi, float) else sell_rsi,
+                            round(indic["rsi_7"], 2),
                             round(current_vix, 2),
                             round(port_val, 2),
-                            f"{unrealized_plpc*100:.2f}%",
+                            f"{unrealized_plpc * 100:.2f}%",
                             "WIN" if unrealized_plpc > 0 else "LOSS",
                             market_direction,
-                            sell_dist,
-                            sell_status
+                            round(indic["lower_band"], 2),
+                            round(indic["atr_14"], 2),
                         ])
                     except Exception as e:
                         logging.error(f"Failed to sell {symbol}: {e}")
                 else:
-                    logging.info(f"Holding {symbol} (PLPC: {unrealized_plpc:.2%}).")
+                    logging.info(
+                        f"Holding {symbol} | Current={current_price:.2f}  "
+                        f"TP={take_profit_threshold:.2f}  SL={stop_loss_threshold:.2f}"
+                    )
         except Exception as e:
             logging.error(f"Error during sell management: {e}")
 
-        # 4. Check VIX kill switch
+        # 4. Check VIX term structure kill switch
         try:
             if risk_manager.check_vix_kill_switch():
-                msg = "VIX > 30. Kill switch activated. Exiting without trading."
+                msg = "VIX term structure kill switch activated (ratio >= 0.95). Skipping buys."
                 logging.warning(msg)
                 messages.append(msg)
                 time.sleep(300)
@@ -223,34 +218,45 @@ def run_scanner():
         except Exception as e:
             logging.error(f"Error checking VIX kill switch: {e}")
 
-        # 5. Scan for Buys
-        tickers_to_scan = ['TSLA', 'NVDA', 'AMD', 'PLTR', 'COIN', 'MSTR', 'SMCI', 'CRWD', 'SNOW', 'SHOP', 'ROKU', 'SQ', 'META', 'NFLX', 'AMZN', 'UBER', 'DASH']
+        # 5. Scan for Buys — fractional notional market orders
+        tickers_to_scan = [
+            'TSLA', 'NVDA', 'AMD', 'PLTR', 'COIN', 'MSTR', 'SMCI', 'CRWD',
+            'SNOW', 'SHOP', 'ROKU', 'SQ', 'META', 'NFLX', 'AMZN', 'UBER', 'DASH'
+        ]
 
-        recap_rsi_list = []
-        recap_blocked = []
-        closest_rsi = 999
-        closest_ticker = "None"
-        reason_no_buy = "N/A"
+        recap_rsi_list  = []
+        recap_blocked   = []
+        closest_margin  = float('inf')
+        closest_ticker  = "None"
+        reason_no_buy   = "N/A"
 
         try:
-            positions = trading_client.get_all_positions()
+            positions    = trading_client.get_all_positions()
             owned_tickers = {p.symbol for p in positions}
 
             for ticker in tickers_to_scan:
                 indic = strategy.check_rsi_buy_signal(data_client, ticker)
-                if not indic: continue
+                if not indic:
+                    continue
 
-                rsi_val = indic["rsi"]
-                recap_rsi_list.append(rsi_val)
-                if not indic["above_200_sma"]:
+                rsi_7      = indic["rsi_7"]
+                lower_band = indic["lower_band"]
+                recap_rsi_list.append(rsi_7)
+
+                # Track tickers failing the momentum gate (RSI not yet oversold)
+                if rsi_7 >= lower_band:
                     recap_blocked.append(ticker)
-                
-                if not indic["is_buy"] and rsi_val < closest_rsi:
-                    closest_rsi = rsi_val
-                    closest_ticker = ticker
-                    if not indic["above_200_sma"]: reason_no_buy = "Below 200-SMA"
-                    elif not indic["rsi_status"]: reason_no_buy = "RSI >= 40"
-                    elif not indic["price_bounced"]: reason_no_buy = "No Price Bounce"
+
+                # Track the ticker closest to triggering a buy (smallest positive RSI margin)
+                if not indic["is_buy"]:
+                    margin = rsi_7 - lower_band
+                    if margin < closest_margin:
+                        closest_margin = margin
+                        closest_ticker = ticker
+                        if rsi_7 >= lower_band:
+                            reason_no_buy = "RSI Not Oversold"
+                        else:
+                            reason_no_buy = "KAMA or Bounce Failed"
 
                 if ticker in owned_tickers:
                     logging.info(f"Already own {ticker}. Skipping buy check.")
@@ -262,40 +268,43 @@ def run_scanner():
 
                     if size_usd > 0:
                         try:
-                            snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=ticker))[ticker]
-                            current_price = snapshot.latest_trade.price
-                            limit_price = round(current_price * 1.005, 2)
-                            qty = round(size_usd / current_price, 4)
-                            
-                            order_data = LimitOrderRequest(
+                            order_data = MarketOrderRequest(
                                 symbol=ticker,
-                                qty=qty,
+                                notional=round(size_usd, 2),
                                 side=OrderSide.BUY,
-                                time_in_force=TimeInForce.DAY,
-                                limit_price=limit_price
+                                time_in_force=TimeInForce.DAY
                             )
                             trading_client.submit_order(order_data=order_data)
-                            msg = f"BUY {qty} shares of {ticker} at limit ${limit_price} (${size_usd:.2f} total)"
+                            msg = f"BUY ${size_usd:.2f} notional of {ticker} (KAMA-BB-RSI signal)"
                             logging.info(msg)
                             messages.append(msg)
-                            
+
+                            # Fetch price post-submission for logging only
+                            try:
+                                snapshot = data_client.get_stock_snapshot(
+                                    StockSnapshotRequest(symbol_or_symbols=ticker)
+                                )[ticker]
+                                log_price = round(snapshot.latest_trade.price, 2)
+                            except Exception:
+                                log_price = 0.0
+
                             port_val = float(trading_client.get_account().portfolio_value)
                             successful_trades.append([
                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 ticker,
                                 "BUY",
-                                round(current_price, 2),
-                                qty,
+                                log_price,
                                 round(size_usd, 2),
-                                "RSI Strategy",
-                                round(rsi_val, 2),
+                                round(size_usd, 2),
+                                "KAMA-BB-RSI",
+                                round(indic["rsi_7"], 2),
                                 round(current_vix, 2),
                                 round(port_val, 2),
                                 "0.00%",
                                 "",
                                 market_direction,
-                                f"{indic['dist_200_sma']*100:.2f}%",
-                                indic["rsi_status"]
+                                round(indic["lower_band"], 2),
+                                round(indic["atr_14"], 2),
                             ])
                         except Exception as e:
                             logging.error(f"Failed to buy {ticker}: {e}")
@@ -306,7 +315,7 @@ def run_scanner():
         except Exception as e:
             logging.error(f"Error during buy scanning: {e}")
 
-        # 6. Wrap up
+        # 6. Wrap up — Sheets logging then unconditional email recap
         try:
             if gc:
                 if successful_trades:
@@ -314,19 +323,23 @@ def run_scanner():
                     for trade in successful_trades:
                         sheet1.append_row(trade)
                     logging.info("Individual trades logged to Google Sheets.")
-                
+
                 try:
                     recap_sheet = gc.open('Aegis Trading Log').worksheet("Daily Recap")
                     avg_rsi = sum(recap_rsi_list) / len(recap_rsi_list) if recap_rsi_list else 0
+                    closest_label = (
+                        f"{closest_ticker} (margin: {round(closest_margin, 2)})"
+                        if closest_ticker != "None" else "None"
+                    )
                     recap_payload = [
-                        datetime.now().strftime('%Y-%m-%d'),
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         market_direction,
                         round(current_vix, 2),
                         len(successful_trades),
-                        f"{closest_ticker} ({round(closest_rsi, 2)})" if closest_ticker != "None" else "None",
+                        closest_label,
                         reason_no_buy,
                         ", ".join(recap_blocked),
-                        round(avg_rsi, 2)
+                        round(avg_rsi, 2),
                     ]
                     recap_sheet.append_row(recap_payload)
                     logging.info("Daily Recap logged to Google Sheets.")
@@ -335,11 +348,13 @@ def run_scanner():
         except Exception as e:
             logging.error(f"Failed to log to Google Sheets: {e}")
 
-        if successful_trades:
-            compiled_string = "\n".join(messages)
-            send_email("Aegis Trade Alert", compiled_string)
+        # Always send recap email — not gated on successful_trades
+        compiled_string = "\n".join(messages)
+        subject = "Aegis Trade Alert" if successful_trades else "Aegis Daily Recap"
+        send_email(subject, compiled_string)
 
         time.sleep(300)
+
 
 if __name__ == "__main__":
     run_scanner()
