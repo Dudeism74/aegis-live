@@ -7,7 +7,6 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
 import gspread
-import json
 try:
     import zoneinfo
 except ImportError:
@@ -31,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 def send_email(subject, body):
-    sender_email = os.environ.get("SENDER_EMAIL")
+    sender_email    = os.environ.get("SENDER_EMAIL")
     sender_password = os.environ.get("SENDER_PASSWORD")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
 
@@ -41,8 +40,8 @@ def send_email(subject, body):
 
     try:
         msg = MIMEMultipart()
-        msg['From'] = sender_email
-        msg['To'] = recipient_email
+        msg['From']    = sender_email
+        msg['To']      = recipient_email
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
@@ -59,10 +58,10 @@ def send_email(subject, body):
 def run_scanner():
     # 1. Initialize clients
     try:
-        api_key = os.environ.get("APCA_API_KEY_ID", "dummy_key")
+        api_key    = os.environ.get("APCA_API_KEY_ID", "dummy_key")
         api_secret = os.environ.get("APCA_API_SECRET_KEY", "dummy_secret")
         trading_client = TradingClient(api_key, api_secret, paper=True)
-        data_client = StockHistoricalDataClient(api_key, api_secret)
+        data_client    = StockHistoricalDataClient(api_key, api_secret)
         logging.info("Alpaca Trading Client and Data Client initialized.")
     except Exception as e:
         msg = f"Failed to initialize Alpaca Clients: {e}"
@@ -82,9 +81,19 @@ def run_scanner():
         logging.error(f"Failed to initialize gspread: {e}")
         gc = None
 
+    # Tracks which calendar date the EOD recap was last sent to prevent repeat fires.
+    last_recap_date = None
+
     while True:
         messages = []
         messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        # Resolve NY timezone once per iteration — used for PDT shield and recap gate.
+        try:
+            ny_tz = zoneinfo.ZoneInfo("America/New_York")
+        except Exception:
+            ny_tz = timezone.utc
+        now_ny = datetime.now(ny_tz)
 
         # 2. Check if market is open
         try:
@@ -99,22 +108,23 @@ def run_scanner():
             continue
 
         # Fetch global metrics
-        current_vix = risk_manager.get_vix()
+        current_vix      = risk_manager.get_vix()
         market_direction = risk_manager.get_market_direction()
 
         successful_trades = []
+
+        # Recap accumulators — populated in step 5, consumed in step 6.
+        recap_rsi_list = []
+        recap_blocked  = []
+        closest_margin = float('inf')
+        closest_ticker = "None"
+        reason_no_buy  = "N/A"
 
         # 3. Manage Sells — dynamic ATR exits
         try:
             positions = trading_client.get_all_positions()
 
-            try:
-                ny_tz = zoneinfo.ZoneInfo("America/New_York")
-            except Exception:
-                ny_tz = timezone.utc
-
-            now_ny = datetime.now(ny_tz)
-            today_ny = now_ny.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_ny  = now_ny.replace(hour=0, minute=0, second=0, microsecond=0)
             today_utc = today_ny.astimezone(timezone.utc)
 
             req = GetOrdersRequest(
@@ -135,21 +145,18 @@ def run_scanner():
                     logging.info(f"PDT Shield: {symbol} was bought today. Skipping sell check.")
                     continue
 
-                # Fetch current indicators to get ATR-based thresholds
                 indic = strategy.check_rsi_buy_signal(data_client, symbol)
                 if not indic:
                     logging.warning(f"Could not fetch indicators for {symbol}. Skipping sell check.")
                     continue
 
-                atr_14 = indic["atr_14"]
-                avg_entry_price = float(position.avg_entry_price)
+                atr_14            = indic["atr_14"]
+                avg_entry_price   = float(position.avg_entry_price)
                 take_profit_threshold = avg_entry_price + (3.0 * atr_14)
-                stop_loss_threshold  = avg_entry_price - (2.0 * atr_14)
+                stop_loss_threshold   = avg_entry_price - (2.0 * atr_14)
 
                 try:
-                    snapshot = data_client.get_stock_snapshot(
-                        StockSnapshotRequest(symbol_or_symbols=symbol)
-                    )[symbol]
+                    snapshot      = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
                     current_price = snapshot.latest_trade.price
                 except Exception as e:
                     logging.error(f"Failed to fetch snapshot for {symbol}: {e}")
@@ -178,7 +185,7 @@ def run_scanner():
                         messages.append(msg)
 
                         unrealized_plpc = float(position.unrealized_plpc)
-                        port_val = float(trading_client.get_account().portfolio_value)
+                        port_val        = float(trading_client.get_account().portfolio_value)
 
                         successful_trades.append([
                             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -224,14 +231,8 @@ def run_scanner():
             'SNOW', 'SHOP', 'ROKU', 'SQ', 'META', 'NFLX', 'AMZN', 'UBER', 'DASH'
         ]
 
-        recap_rsi_list  = []
-        recap_blocked   = []
-        closest_margin  = float('inf')
-        closest_ticker  = "None"
-        reason_no_buy   = "N/A"
-
         try:
-            positions    = trading_client.get_all_positions()
+            positions     = trading_client.get_all_positions()
             owned_tickers = {p.symbol for p in positions}
 
             for ticker in tickers_to_scan:
@@ -243,20 +244,15 @@ def run_scanner():
                 lower_band = indic["lower_band"]
                 recap_rsi_list.append(rsi_7)
 
-                # Track tickers failing the momentum gate (RSI not yet oversold)
                 if rsi_7 >= lower_band:
                     recap_blocked.append(ticker)
 
-                # Track the ticker closest to triggering a buy (smallest positive RSI margin)
                 if not indic["is_buy"]:
                     margin = rsi_7 - lower_band
                     if margin < closest_margin:
                         closest_margin = margin
                         closest_ticker = ticker
-                        if rsi_7 >= lower_band:
-                            reason_no_buy = "RSI Not Oversold"
-                        else:
-                            reason_no_buy = "KAMA or Bounce Failed"
+                        reason_no_buy  = "RSI Not Oversold" if rsi_7 >= lower_band else "KAMA or Bounce Failed"
 
                 if ticker in owned_tickers:
                     logging.info(f"Already own {ticker}. Skipping buy check.")
@@ -279,11 +275,8 @@ def run_scanner():
                             logging.info(msg)
                             messages.append(msg)
 
-                            # Fetch price post-submission for logging only
                             try:
-                                snapshot = data_client.get_stock_snapshot(
-                                    StockSnapshotRequest(symbol_or_symbols=ticker)
-                                )[ticker]
+                                snapshot  = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=ticker))[ticker]
                                 log_price = round(snapshot.latest_trade.price, 2)
                             except Exception:
                                 log_price = 0.0
@@ -315,43 +308,65 @@ def run_scanner():
         except Exception as e:
             logging.error(f"Error during buy scanning: {e}")
 
-        # 6. Wrap up — Sheets logging then unconditional email recap
-        try:
-            if gc:
-                if successful_trades:
-                    sheet1 = gc.open('Aegis Trading Log').sheet1
-                    for trade in successful_trades:
-                        sheet1.append_row(trade)
-                    logging.info("Individual trades logged to Google Sheets.")
+        # 6. Wrap up
 
-                try:
-                    recap_sheet = gc.open('Aegis Trading Log').worksheet("Daily Recap")
-                    avg_rsi = sum(recap_rsi_list) / len(recap_rsi_list) if recap_rsi_list else 0
-                    closest_label = (
-                        f"{closest_ticker} (margin: {round(closest_margin, 2)})"
-                        if closest_ticker != "None" else "None"
-                    )
-                    recap_payload = [
-                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        market_direction,
-                        round(current_vix, 2),
-                        len(successful_trades),
-                        closest_label,
-                        reason_no_buy,
-                        ", ".join(recap_blocked),
-                        round(avg_rsi, 2),
-                    ]
-                    recap_sheet.append_row(recap_payload)
-                    logging.info("Daily Recap logged to Google Sheets.")
-                except Exception as e:
-                    logging.error(f"Failed to log Daily Recap: {e}")
-        except Exception as e:
-            logging.error(f"Failed to log to Google Sheets: {e}")
+        # Log individual trades to Google Sheets on every iteration that has trades.
+        if gc and successful_trades:
+            try:
+                sheet1 = gc.open('Aegis Trading Log').sheet1
+                for trade in successful_trades:
+                    sheet1.append_row(trade)
+                logging.info("Individual trades logged to Google Sheets.")
+            except Exception as e:
+                logging.error(f"Failed to log trades to Google Sheets: {e}")
 
-        # Always send recap email — not gated on successful_trades
-        compiled_string = "\n".join(messages)
-        subject = "Aegis Trade Alert" if successful_trades else "Aegis Daily Recap"
-        send_email(subject, compiled_string)
+        # Trade alert email — fires only when a trade executed this iteration.
+        if successful_trades:
+            send_email("Aegis Trade Alert", "\n".join(messages))
+
+        # EOD Daily Recap — time-gated to 15:50–16:00 EST, fires once per calendar day.
+        in_recap_window = (now_ny.hour == 15 and now_ny.minute >= 50) or (now_ny.hour == 16 and now_ny.minute == 0)
+        if in_recap_window and now_ny.date() != last_recap_date:
+            try:
+                avg_rsi = sum(recap_rsi_list) / len(recap_rsi_list) if recap_rsi_list else 0
+                closest_label = (
+                    f"{closest_ticker} (margin: {round(closest_margin, 2)})"
+                    if closest_ticker != "None" else "None"
+                )
+                recap_payload = [
+                    now_ny.strftime('%Y-%m-%d %H:%M:%S'),
+                    market_direction,
+                    round(current_vix, 2),
+                    len(successful_trades),
+                    closest_label,
+                    reason_no_buy,
+                    ", ".join(recap_blocked),
+                    round(avg_rsi, 2),
+                ]
+
+                if gc:
+                    try:
+                        recap_sheet = gc.open('Aegis Trading Log').worksheet("Daily Recap")
+                        recap_sheet.append_row(recap_payload)
+                        logging.info("Daily Recap logged to Google Sheets.")
+                    except Exception as e:
+                        logging.error(f"Failed to log Daily Recap to Google Sheets: {e}")
+
+                recap_body = (
+                    f"Aegis EOD Recap — {now_ny.strftime('%Y-%m-%d')}\n\n"
+                    f"Market Direction : {market_direction}\n"
+                    f"VIX              : {round(current_vix, 2)}\n"
+                    f"Trades Today     : {len(successful_trades)}\n"
+                    f"Closest Signal   : {closest_label}\n"
+                    f"Reason No Buy    : {reason_no_buy}\n"
+                    f"Blocked Tickers  : {', '.join(recap_blocked) if recap_blocked else 'None'}\n"
+                    f"Avg RSI_7        : {round(avg_rsi, 2)}\n"
+                )
+                send_email("Aegis Daily Recap", recap_body)
+                last_recap_date = now_ny.date()
+
+            except Exception as e:
+                logging.error(f"Failed to process EOD Daily Recap: {e}")
 
         time.sleep(300)
 
