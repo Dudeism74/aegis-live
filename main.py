@@ -108,8 +108,8 @@ def run_scanner():
             continue
 
         # Fetch global metrics
-        current_vix      = risk_manager.get_vix()
-        market_direction = risk_manager.get_market_direction()
+        current_vix      = risk_manager.get_vix(data_client)
+        market_direction = risk_manager.get_market_direction(data_client)
 
         successful_trades = []
 
@@ -216,7 +216,7 @@ def run_scanner():
 
         # 4. Check VIX term structure kill switch
         try:
-            if risk_manager.check_vix_kill_switch():
+            if risk_manager.check_vix_kill_switch(data_client):
                 msg = "VIX term structure kill switch activated (ratio >= 0.95). Skipping buys."
                 logging.warning(msg)
                 messages.append(msg)
