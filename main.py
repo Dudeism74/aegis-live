@@ -28,6 +28,9 @@ load_dotenv(dotenv_path=env_path)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Path to the Telegram C&C lock file. When this file exists the trading loop suspends.
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'aegis.lock')
+
 
 def send_email(subject, body):
     sender_email    = os.environ.get("SENDER_EMAIL")
@@ -85,6 +88,12 @@ def run_scanner():
     last_recap_date = None
 
     while True:
+        # Remote kill switch — suspends entire trading loop when aegis.lock is present.
+        if os.path.exists(LOCK_FILE):
+            logging.info("Aegis paused via Telegram. Sleeping 300s.")
+            time.sleep(300)
+            continue
+
         messages = []
         messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
