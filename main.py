@@ -26,10 +26,14 @@ from dotenv import load_dotenv
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 load_dotenv(dotenv_path=env_path)
 
+# Log timestamps in US/Eastern time (EST/EDT) by overriding the class-level
+# converter used by every logging.Formatter instance.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Path to the Telegram C&C lock file. When this file exists the trading loop suspends.
-LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'aegis.lock')
+try:
+    _eastern = zoneinfo.ZoneInfo("America/New_York")
+    logging.Formatter.converter = lambda *args: datetime.now(_eastern).timetuple()
+except Exception:
+    pass
 
 
 def send_email(subject, body):
@@ -88,12 +92,6 @@ def run_scanner():
     last_recap_date = None
 
     while True:
-        # Remote kill switch — suspends entire trading loop when aegis.lock is present.
-        if os.path.exists(LOCK_FILE):
-            logging.info("Aegis paused via Telegram. Sleeping 300s.")
-            time.sleep(300)
-            continue
-
         messages = []
         messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
@@ -159,8 +157,8 @@ def run_scanner():
                     logging.warning(f"Could not fetch indicators for {symbol}. Skipping sell check.")
                     continue
 
-                atr_14            = indic["atr_14"]
-                avg_entry_price   = float(position.avg_entry_price)
+                atr_14                = indic["atr_14"]
+                avg_entry_price       = float(position.avg_entry_price)
                 take_profit_threshold = avg_entry_price + (3.0 * atr_14)
                 stop_loss_threshold   = avg_entry_price - (2.0 * atr_14)
 
@@ -237,7 +235,7 @@ def run_scanner():
         # 5. Scan for Buys — fractional notional market orders
         tickers_to_scan = [
             'TSLA', 'NVDA', 'AMD', 'PLTR', 'COIN', 'MSTR', 'SMCI', 'CRWD',
-            'SNOW', 'SHOP', 'ROKU', 'SQ', 'META', 'NFLX', 'AMZN', 'UBER', 'DASH'
+            'SNOW', 'SHOP', 'ROKU', 'MSFT', 'META', 'NFLX', 'AMZN', 'UBER', 'DASH'
         ]
 
         try:
@@ -290,13 +288,14 @@ def run_scanner():
                             except Exception:
                                 log_price = 0.0
 
+                            fractional_shares = round(size_usd / log_price, 4) if log_price > 0 else 0.0
                             port_val = float(trading_client.get_account().portfolio_value)
                             successful_trades.append([
                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 ticker,
                                 "BUY",
                                 log_price,
-                                round(size_usd, 2),
+                                fractional_shares,
                                 round(size_usd, 2),
                                 "KAMA-BB-RSI",
                                 round(indic["rsi_7"], 2),
