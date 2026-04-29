@@ -1,5 +1,6 @@
 import os
 import sys
+import csv
 import time
 import logging
 import smtplib
@@ -34,6 +35,41 @@ try:
     logging.Formatter.converter = lambda *args: datetime.now(_eastern).timetuple()
 except Exception:
     pass
+
+# Absolute path to the local master trade log. Used for persistent BUY counting
+# across reboots and as the ground truth for the daily recap tally.
+_BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+TRADES_CSV = os.path.join(_BASE_DIR, 'Aegis Trading Log - Sheet1.csv')
+
+
+def write_trade_to_csv(row):
+    """Append one completed trade row to the local master CSV."""
+    try:
+        with open(TRADES_CSV, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+    except Exception as e:
+        logging.error(f"Failed to write trade to local CSV: {type(e).__name__}: {e}")
+
+
+def count_buys_today(date_str):
+    """
+    Read TRADES_CSV and return the number of BUY rows whose timestamp starts
+    with date_str (YYYY-MM-DD). Returns 0 if the file is absent or unreadable.
+    """
+    try:
+        with open(TRADES_CSV, 'r', newline='') as f:
+            return sum(
+                1 for row in csv.reader(f)
+                if len(row) >= 3
+                and row[2].strip() == 'BUY'
+                and row[0].startswith(date_str)
+            )
+    except FileNotFoundError:
+        logging.warning(f"Local trades CSV not found at {TRADES_CSV}. Returning 0 for recap.")
+        return 0
+    except Exception as e:
+        logging.error(f"Failed to count buys from local CSV: {type(e).__name__}: {e}")
+        return 0
 
 
 def send_email(subject, body):
@@ -78,7 +114,7 @@ def run_scanner():
 
     try:
         gc = None
-        cred_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
+        cred_path = os.path.join(_BASE_DIR, 'credentials.json')
         gc = gspread.service_account(filename=cred_path)
         if gc:
             logging.info("Google Sheets initialized.")
@@ -95,7 +131,7 @@ def run_scanner():
         messages = []
         messages.append(f"Aegis Trading Bot Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-        # Resolve NY timezone once per iteration — used for PDT shield and recap gate.
+        # Resolve NY timezone once per iteration, used for PDT shield and recap gate.
         try:
             ny_tz = zoneinfo.ZoneInfo("America/New_York")
         except Exception:
@@ -120,14 +156,14 @@ def run_scanner():
 
         successful_trades = []
 
-        # Recap accumulators — populated in step 5, consumed in step 6.
+        # Recap accumulators, populated in step 5 and consumed in step 6.
         recap_rsi_list = []
         recap_blocked  = []
         closest_margin = float('inf')
         closest_ticker = "None"
         reason_no_buy  = "N/A"
 
-        # 3. Manage Sells — dynamic ATR exits
+        # 3. Manage Sells, dynamic ATR exits with latency, slippage, and duration telemetry
         try:
             positions = trading_client.get_all_positions()
 
@@ -173,7 +209,7 @@ def run_scanner():
                 stop_loss   = current_price <= stop_loss_threshold
 
                 if take_profit or stop_loss:
-                    reason = "Take Profit (3×ATR)" if take_profit else "Stop Loss (2×ATR)"
+                    reason = "Take Profit (3xATR)" if take_profit else "Stop Loss (2xATR)"
                     logging.info(
                         f"Triggering {reason} for {symbol} | "
                         f"Entry={avg_entry_price:.2f}  Current={current_price:.2f}  ATR={atr_14:.2f}  "
@@ -186,15 +222,71 @@ def run_scanner():
                             side=OrderSide.SELL,
                             time_in_force=TimeInForce.DAY
                         )
-                        trading_client.submit_order(order_data=order_data)
+
+                        # Latency sensor: bracket submit_order in milliseconds
+                        t_before  = time.time()
+                        sell_resp = trading_client.submit_order(order_data=order_data)
+                        t_after   = time.time()
+                        sell_latency_ms = round((t_after - t_before) * 1000, 2)
+
                         msg = f"SELL {position.qty} shares of {symbol} at market ({reason})"
                         logging.info(msg)
                         messages.append(msg)
 
+                        # Slippage sensor: allow fill window then fetch average_fill_price
+                        # Signal price for sells is the pre-order snapshot (current_price)
+                        time.sleep(1.0)
+                        sell_fill_price = None
+                        try:
+                            filled_sell = trading_client.get_order_by_id(str(sell_resp.id))
+                            if filled_sell.filled_avg_price is not None:
+                                sell_fill_price = round(float(filled_sell.filled_avg_price), 4)
+                        except Exception as fe:
+                            logging.warning(
+                                f"Could not fetch sell fill price for {symbol}: "
+                                f"{type(fe).__name__}: {fe}"
+                            )
+
+                        if sell_fill_price and current_price > 0:
+                            sell_slip_dollar = round(sell_fill_price - current_price, 4)
+                            sell_slip_pct    = round(
+                                (sell_fill_price - current_price) / current_price * 100, 4
+                            )
+                        else:
+                            sell_slip_dollar = 0
+                            sell_slip_pct    = 0
+
+                        # Duration sensor: scan closed orders to find the original buy fill time
+                        hold_duration_str = "N/A"
+                        try:
+                            order_history = trading_client.get_orders(GetOrdersRequest(
+                                status=QueryOrderStatus.CLOSED,
+                                limit=100
+                            ))
+                            for o in order_history:
+                                if o.symbol == symbol and o.side == OrderSide.BUY and o.filled_at:
+                                    delta = datetime.now(timezone.utc) - o.filled_at
+                                    h = int(delta.total_seconds() // 3600)
+                                    m = int((delta.total_seconds() % 3600) // 60)
+                                    hold_duration_str = f"{h}h {m}m"
+                                    break
+                        except Exception as de:
+                            logging.warning(
+                                f"Could not calculate hold duration for {symbol}: "
+                                f"{type(de).__name__}: {de}"
+                            )
+
+                        logging.info(
+                            f"Telemetry SELL {symbol} | latency={sell_latency_ms}ms  "
+                            f"signal={current_price}  fill={sell_fill_price}  "
+                            f"slippage=${sell_slip_dollar} ({sell_slip_pct}%)  "
+                            f"hold={hold_duration_str}"
+                        )
+
                         unrealized_plpc = float(position.unrealized_plpc)
                         port_val        = float(trading_client.get_account().portfolio_value)
 
-                        successful_trades.append([
+                        trade_row = [
                             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             symbol,
                             "SELL",
@@ -210,7 +302,15 @@ def run_scanner():
                             market_direction,
                             round(indic["lower_band"], 2),
                             round(indic["atr_14"], 2),
-                        ])
+                            # Telemetry fields appended to master log
+                            sell_latency_ms,
+                            sell_slip_dollar,
+                            sell_slip_pct,
+                            hold_duration_str,
+                        ]
+                        successful_trades.append(trade_row)
+                        write_trade_to_csv(trade_row)
+
                     except Exception as e:
                         logging.error(f"Failed to sell {symbol}: {e}")
                 else:
@@ -232,7 +332,7 @@ def run_scanner():
         except Exception as e:
             logging.error(f"Error checking VIX kill switch: {e}")
 
-        # 5. Scan for Buys — fractional notional market orders
+        # 5. Scan for Buys, fractional notional market orders with latency and slippage telemetry
         tickers_to_scan = [
             'TSLA', 'NVDA', 'AMD', 'PLTR', 'COIN', 'MSTR', 'SMCI', 'CRWD',
             'SNOW', 'SHOP', 'ROKU', 'MSFT', 'META', 'NFLX', 'AMZN', 'UBER', 'DASH'
@@ -271,26 +371,69 @@ def run_scanner():
 
                     if size_usd > 0:
                         try:
+                            # Slippage sensor step 1: capture signal price before order submission
+                            signal_price = 0.0
+                            try:
+                                pre_snap     = data_client.get_stock_snapshot(
+                                    StockSnapshotRequest(symbol_or_symbols=ticker)
+                                )[ticker]
+                                signal_price = round(pre_snap.latest_trade.price, 2)
+                            except Exception as se:
+                                logging.warning(
+                                    f"Pre-order snapshot failed for {ticker}: "
+                                    f"{type(se).__name__}: {se}"
+                                )
+
                             order_data = MarketOrderRequest(
                                 symbol=ticker,
                                 notional=round(size_usd, 2),
                                 side=OrderSide.BUY,
                                 time_in_force=TimeInForce.DAY
                             )
-                            trading_client.submit_order(order_data=order_data)
+
+                            # Latency sensor: bracket submit_order in milliseconds
+                            t_before   = time.time()
+                            order_resp = trading_client.submit_order(order_data=order_data)
+                            t_after    = time.time()
+                            buy_latency_ms = round((t_after - t_before) * 1000, 2)
+
                             msg = f"BUY ${size_usd:.2f} notional of {ticker} (KAMA-BB-RSI signal)"
                             logging.info(msg)
                             messages.append(msg)
 
+                            # Slippage sensor step 2: allow fill window then fetch average_fill_price
+                            time.sleep(1.0)
+                            buy_fill_price = None
                             try:
-                                snapshot  = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=ticker))[ticker]
-                                log_price = round(snapshot.latest_trade.price, 2)
-                            except Exception:
-                                log_price = 0.0
+                                filled_order = trading_client.get_order_by_id(str(order_resp.id))
+                                if filled_order.filled_avg_price is not None:
+                                    buy_fill_price = round(float(filled_order.filled_avg_price), 4)
+                            except Exception as fe:
+                                logging.warning(
+                                    f"Could not fetch fill price for {ticker}: "
+                                    f"{type(fe).__name__}: {fe}"
+                                )
 
+                            if buy_fill_price and signal_price > 0:
+                                slippage_dollar = round(buy_fill_price - signal_price, 4)
+                                slippage_pct    = round(
+                                    (buy_fill_price - signal_price) / signal_price * 100, 4
+                                )
+                            else:
+                                slippage_dollar = 0
+                                slippage_pct    = 0
+
+                            log_price         = signal_price if signal_price > 0 else (buy_fill_price or 0.0)
                             fractional_shares = round(size_usd / log_price, 4) if log_price > 0 else 0.0
-                            port_val = float(trading_client.get_account().portfolio_value)
-                            successful_trades.append([
+
+                            logging.info(
+                                f"Telemetry BUY {ticker} | latency={buy_latency_ms}ms  "
+                                f"signal={signal_price}  fill={buy_fill_price}  "
+                                f"slippage=${slippage_dollar} ({slippage_pct}%)"
+                            )
+
+                            port_val  = float(trading_client.get_account().portfolio_value)
+                            trade_row = [
                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 ticker,
                                 "BUY",
@@ -306,7 +449,15 @@ def run_scanner():
                                 market_direction,
                                 round(indic["lower_band"], 2),
                                 round(indic["atr_14"], 2),
-                            ])
+                                # Telemetry fields appended to master log
+                                buy_latency_ms,
+                                slippage_dollar,
+                                slippage_pct,
+                                "N/A",
+                            ]
+                            successful_trades.append(trade_row)
+                            write_trade_to_csv(trade_row)
+
                         except Exception as e:
                             logging.error(f"Failed to buy {ticker}: {e}")
                     else:
@@ -318,7 +469,7 @@ def run_scanner():
 
         # 6. Wrap up
 
-        # Log individual trades to Google Sheets on every iteration that has trades.
+        # Log trades to Google Sheets. Local CSV writes are done inline above for reboot resilience.
         if gc and successful_trades:
             try:
                 sheet1 = gc.open('Aegis Trading Log').sheet1
@@ -328,14 +479,21 @@ def run_scanner():
             except Exception as e:
                 logging.error(f"Failed to log trades to Google Sheets: {e}")
 
-        # Trade alert email — fires only when a trade executed this iteration.
+        # Trade alert email, fires only when a trade executed this iteration.
         if successful_trades:
             send_email("Aegis Trade Alert", "\n".join(messages))
 
-        # EOD Daily Recap — time-gated to 15:50–16:00 EST, fires once per calendar day.
-        in_recap_window = (now_ny.hour == 15 and now_ny.minute >= 50) or (now_ny.hour == 16 and now_ny.minute == 0)
+        # EOD Daily Recap, time-gated to 15:50-16:00 EST, fires once per calendar day.
+        in_recap_window = (
+            (now_ny.hour == 15 and now_ny.minute >= 50) or
+            (now_ny.hour == 16 and now_ny.minute == 0)
+        )
         if in_recap_window and now_ny.date() != last_recap_date:
             try:
+                # Read the local CSV directly to count buys, bypassing the volatile RAM counter
+                today_str  = now_ny.strftime('%Y-%m-%d')
+                buys_today = count_buys_today(today_str)
+
                 avg_rsi = sum(recap_rsi_list) / len(recap_rsi_list) if recap_rsi_list else 0
                 closest_label = (
                     f"{closest_ticker} (margin: {round(closest_margin, 2)})"
@@ -345,7 +503,7 @@ def run_scanner():
                     now_ny.strftime('%Y-%m-%d %H:%M:%S'),
                     market_direction,
                     round(current_vix, 2),
-                    len(successful_trades),
+                    buys_today,
                     closest_label,
                     reason_no_buy,
                     ", ".join(recap_blocked),
@@ -361,10 +519,10 @@ def run_scanner():
                         logging.error(f"Failed to log Daily Recap to Google Sheets: {e}")
 
                 recap_body = (
-                    f"Aegis EOD Recap — {now_ny.strftime('%Y-%m-%d')}\n\n"
+                    f"Aegis EOD Recap - {now_ny.strftime('%Y-%m-%d')}\n\n"
                     f"Market Direction : {market_direction}\n"
                     f"VIX              : {round(current_vix, 2)}\n"
-                    f"Trades Today     : {len(successful_trades)}\n"
+                    f"Trades Today     : {buys_today}\n"
                     f"Closest Signal   : {closest_label}\n"
                     f"Reason No Buy    : {reason_no_buy}\n"
                     f"Blocked Tickers  : {', '.join(recap_blocked) if recap_blocked else 'None'}\n"
