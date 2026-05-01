@@ -367,6 +367,24 @@ def run_scanner():
 
                 if indic["is_buy"]:
                     logging.info(f"Buy signal triggered for {ticker}.")
+
+                    # ── Portfolio Governor ────────────────────────────────────
+                    # Hard cap: 5 open positions, $720 minimum available cash.
+                    live_positions = trading_client.get_all_positions()
+                    if len(live_positions) >= 5:
+                        gov_msg = f"Portfolio Capacity Reached (5/5). Skipping buy for {ticker}."
+                        logging.warning(gov_msg)
+                        messages.append("Portfolio Capacity Reached (5/5)")
+                        continue
+                    acct_cash = float(trading_client.get_account().cash)
+                    if acct_cash < 720.0:
+                        logging.warning(
+                            f"Insufficient cash (${acct_cash:.2f} < $720.00). "
+                            f"Skipping buy for {ticker}."
+                        )
+                        continue
+                    # ─────────────────────────────────────────────────────────
+
                     size_usd = portfolio.calculate_position_size(trading_client)
 
                     if size_usd > 0:
@@ -471,13 +489,33 @@ def run_scanner():
 
         # Log trades to Google Sheets. Local CSV writes are done inline above for reboot resilience.
         if gc and successful_trades:
-            try:
-                sheet1 = gc.open('Aegis Trading Log').sheet1
-                for trade in successful_trades:
-                    sheet1.append_row(trade)
-                logging.info("Individual trades logged to Google Sheets.")
-            except Exception as e:
-                logging.error(f"Failed to log trades to Google Sheets: {e}")
+            # ── Ledger Integrity Loop ─────────────────────────────────────────
+            # Open the worksheet by name (never by index) to survive tab reorders.
+            # Retry indefinitely on timeout/connection errors — never skip a write.
+            sheet1 = None
+            while sheet1 is None:
+                try:
+                    sheet1 = gc.open('Aegis Trading Log').worksheet("Sheet1")
+                except Exception as e:
+                    logging.error(
+                        f"Cannot open 'Sheet1', retrying in 5s: {type(e).__name__}: {e}"
+                    )
+                    time.sleep(5)
+
+            for trade in successful_trades:
+                logged = False
+                while not logged:
+                    try:
+                        sheet1.append_row(trade)
+                        logged = True
+                    except Exception as e:
+                        logging.error(
+                            f"append_row failed for trade, retrying in 5s: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        time.sleep(5)
+            logging.info("Individual trades logged to Google Sheets.")
+            # ─────────────────────────────────────────────────────────────────
 
         # Trade alert email, fires only when a trade executed this iteration.
         if successful_trades:
@@ -511,12 +549,30 @@ def run_scanner():
                 ]
 
                 if gc:
-                    try:
-                        recap_sheet = gc.open('Aegis Trading Log').worksheet("Daily Recap")
-                        recap_sheet.append_row(recap_payload)
-                        logging.info("Daily Recap logged to Google Sheets.")
-                    except Exception as e:
-                        logging.error(f"Failed to log Daily Recap to Google Sheets: {e}")
+                    # ── Ledger Integrity Loop (Daily Recap) ──────────────────
+                    recap_sheet = None
+                    while recap_sheet is None:
+                        try:
+                            recap_sheet = gc.open('Aegis Trading Log').worksheet("Daily Recap")
+                        except Exception as e:
+                            logging.error(
+                                f"Cannot open 'Daily Recap' sheet, retrying in 5s: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            time.sleep(5)
+                    recap_logged = False
+                    while not recap_logged:
+                        try:
+                            recap_sheet.append_row(recap_payload)
+                            recap_logged = True
+                            logging.info("Daily Recap logged to Google Sheets.")
+                        except Exception as e:
+                            logging.error(
+                                f"Daily Recap append_row failed, retrying in 5s: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            time.sleep(5)
+                    # ────────────────────────────────────────────────────────
 
                 recap_body = (
                     f"Aegis EOD Recap - {now_ny.strftime('%Y-%m-%d')}\n\n"
