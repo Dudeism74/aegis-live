@@ -444,10 +444,15 @@ def run_scanner():
                             log_price         = signal_price if signal_price > 0 else (buy_fill_price or 0.0)
                             fractional_shares = round(size_usd / log_price, 4) if log_price > 0 else 0.0
 
+                            entry_atr          = indic["atr_14"]
+                            stop_loss_target   = round(log_price - (2 * entry_atr), 2)
+                            take_profit_target = round(log_price + (3 * entry_atr), 2)
+
                             logging.info(
                                 f"Telemetry BUY {ticker} | latency={buy_latency_ms}ms  "
                                 f"signal={signal_price}  fill={buy_fill_price}  "
-                                f"slippage=${slippage_dollar} ({slippage_pct}%)"
+                                f"slippage=${slippage_dollar} ({slippage_pct}%)  "
+                                f"ATR={entry_atr:.2f}  SL={stop_loss_target}  TP={take_profit_target}"
                             )
 
                             port_val  = float(trading_client.get_account().portfolio_value)
@@ -456,6 +461,9 @@ def run_scanner():
                                 ticker,
                                 "BUY",
                                 log_price,
+                                entry_atr,
+                                stop_loss_target,
+                                take_profit_target,
                                 fractional_shares,
                                 round(size_usd, 2),
                                 "KAMA-BB-RSI",
