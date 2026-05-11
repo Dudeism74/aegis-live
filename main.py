@@ -423,12 +423,15 @@ def run_scanner():
                             messages.append(msg)
 
                             # Slippage sensor step 2: allow fill window then fetch average_fill_price
-                            time.sleep(1.0)
+                            time.sleep(2.0)
                             buy_fill_price = None
+                            actual_filled_qty = None
                             try:
                                 filled_order = trading_client.get_order_by_id(str(order_resp.id))
                                 if filled_order.filled_avg_price is not None:
                                     buy_fill_price = round(float(filled_order.filled_avg_price), 4)
+                                if filled_order.filled_qty is not None:
+                                    actual_filled_qty = float(filled_order.filled_qty)
                             except Exception as fe:
                                 logging.warning(
                                     f"Could not fetch fill price for {ticker}: "
@@ -445,7 +448,7 @@ def run_scanner():
                                 slippage_pct    = 0
 
                             log_price         = signal_price if signal_price > 0 else (buy_fill_price or 0.0)
-                            fractional_shares = round(size_usd / log_price, 4) if log_price > 0 else 0.0
+                            fractional_shares = actual_filled_qty if actual_filled_qty is not None else (size_usd / log_price if log_price > 0 else 0.0)
 
                             entry_atr          = indic["atr_14"]
                             stop_loss_target   = round(log_price - (2 * entry_atr), 2)
@@ -453,7 +456,7 @@ def run_scanner():
 
                             logging.info(
                                 f"Telemetry BUY {ticker} | latency={buy_latency_ms}ms  "
-                                f"signal={signal_price}  fill={buy_fill_price}  "
+                                f"signal={signal_price}  fill={buy_fill_price}  filled_qty={fractional_shares}  "
                                 f"slippage=${slippage_dollar} ({slippage_pct}%)  "
                                 f"ATR={entry_atr:.2f}  SL={stop_loss_target}  TP={take_profit_target}"
                             )
