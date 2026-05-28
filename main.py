@@ -11,7 +11,7 @@ import gspread
 try:
     import zoneinfo
 except ImportError:
-    from backports import zoneinfo
+    from backports import zoneinfo  # type: ignore
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
@@ -70,6 +70,65 @@ def count_buys_today(date_str):
     except Exception as e:
         logging.error(f"Failed to count buys from local CSV: {type(e).__name__}: {e}")
         return 0
+
+
+def ensure_dashboard_ticker(gc, ticker):
+    """
+    Ensure the ticker exists in the 'Dashboard' sheet. If not, append a new row
+    with the required formulas for Net Shares Owned and Avg Buy Price.
+    """
+    if not gc:
+        return
+
+    dashboard = None
+    while dashboard is None:
+        try:
+            dashboard = gc.open('Aegis Trading Log').worksheet("Dashboard")
+        except Exception as e:
+            logging.error(
+                f"Cannot open 'Dashboard' sheet, retrying in 5s: "
+                f"{type(e).__name__}: {e}"
+            )
+            time.sleep(5)
+
+    try:
+        tickers = dashboard.col_values(1)
+        ticker_upper = ticker.upper().strip()
+
+        if ticker_upper in [t.upper().strip() for t in tickers]:
+            logging.info(f"Ticker {ticker_upper} already exists in Dashboard.")
+            return
+
+        new_row_idx = len(tickers) + 1
+
+        shares_formula = (
+            f'=ROUND(SUMIFS(Sheet1!H:H, Sheet1!B:B, A{new_row_idx}, Sheet1!C:C, "BUY") - '
+            f'SUMIFS(Sheet1!H:H, Sheet1!B:B, A{new_row_idx}, Sheet1!C:C, "SELL"), 6)'
+        )
+        avg_price_formula = (
+            f'=IF(D{new_row_idx}>0, SUMPRODUCT((Sheet1!B:B=A{new_row_idx})*(Sheet1!C:C="BUY")*'
+            f'(ROW(Sheet1!B:B)>MAX(INDEX((Sheet1!B:B=A{new_row_idx})*(Sheet1!C:C="SELL")*'
+            f'ROW(Sheet1!B:B), 0))), Sheet1!D:D, Sheet1!H:H) / D{new_row_idx}, 0)'
+        )
+
+        row_data = [ticker_upper, "", "", shares_formula, avg_price_formula]
+
+        logged = False
+        while not logged:
+            try:
+                dashboard.append_row(row_data, value_input_option='USER_ENTERED')
+                logged = True
+            except Exception as e:
+                logging.error(
+                    f"append_row to Dashboard failed for {ticker_upper}, retrying in 5s: "
+                    f"{type(e).__name__}: {e}"
+                )
+                time.sleep(5)
+
+        logging.info(f"Successfully added {ticker_upper} to Dashboard at row {new_row_idx}.")
+
+    except Exception as e:
+        logging.error(f"Failed to ensure ticker {ticker} in Dashboard: {type(e).__name__}: {e}")
 
 
 def send_email(subject, body):
@@ -528,6 +587,9 @@ def run_scanner():
                             f"{type(e).__name__}: {e}"
                         )
                         time.sleep(5)
+                
+                # After successful append to Sheet1, ensure ticker exists in Dashboard
+                ensure_dashboard_ticker(gc, trade[1])
             logging.info("Individual trades logged to Google Sheets.")
             # ─────────────────────────────────────────────────────────────────
 
