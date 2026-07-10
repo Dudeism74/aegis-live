@@ -3,6 +3,9 @@
 Keep `.env`, `credentials.json`, the historical CSV, and `aegis_ledger.sqlite3`
 outside version control. Back them up before replacing the deployed code.
 
+Set `AEGIS_STRATEGY_CAPITAL=3600` in `.env`. This prevents Alpaca's much larger
+paper-account equity from inflating the strategy's intended position sizes.
+
 ## Preferred: Always-on Task
 
 Run one persistent process:

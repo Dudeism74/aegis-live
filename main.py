@@ -324,7 +324,8 @@ class Scanner:
                 continue
             signal = self.price(ticker)
             size_usd = portfolio.calculate_position_size(
-                self.trading, entry_price=signal, entry_atr=float(indic["atr_14"])
+                self.trading, entry_price=signal, entry_atr=float(indic["atr_14"]),
+                strategy_capital=float(os.getenv("AEGIS_STRATEGY_CAPITAL", "3600")),
             )
             if size_usd <= 0:
                 continue

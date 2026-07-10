@@ -50,16 +50,22 @@ def submitted(ledger: Ledger, order_id="1", side="buy", status="new"):
 
 
 def test_risk_position_sizing_uses_two_atr_stop():
-    # $500 risk / $8 stop = 62.5 shares * $100.
-    assert portfolio.calculate_position_size(AccountClient(), 100, 4) == 6250
+    # $18 risk / $8 stop = 2.25 shares * $100.
+    assert portfolio.calculate_position_size(AccountClient(), 100, 4) == 225
 
 
 def test_position_sizing_respects_twenty_percent_cap():
-    assert portfolio.calculate_position_size(AccountClient(), 100, 0.25) == 20_000
+    assert portfolio.calculate_position_size(AccountClient(), 100, 0.25) == 720
+
+
+def test_position_sizing_can_explicitly_use_full_account_equity():
+    assert portfolio.calculate_position_size(
+        AccountClient(), 100, 4, strategy_capital=None
+    ) == 6250
 
 
 def test_position_sizing_respects_cash():
-    assert portfolio.calculate_position_size(AccountClient(cash=300), 100, 4) == 300
+    assert portfolio.calculate_position_size(AccountClient(cash=100), 100, 4) == 100
 
 
 def test_invalid_atr_blocks_position():
