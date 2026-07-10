@@ -86,7 +86,9 @@ def check_rsi_buy_signal(data_client, symbol):
         above_kama      = current_close > current_kama
         rsi_oversold    = current_rsi_7 < current_lower_band
         intraday_bounce = current_close > current_open
-        is_buy          = above_kama and rsi_oversold and intraday_bounce
+        # Normalize NumPy boolean scalars so callers and serialized telemetry
+        # always receive a regular Python bool.
+        is_buy          = bool(above_kama and rsi_oversold and intraday_bounce)
 
         if is_buy:
             logging.info(

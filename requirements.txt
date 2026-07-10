@@ -1,0 +1,7 @@
+alpaca-py
+gspread
+numpy
+pandas
+python-dotenv
+ta
+
