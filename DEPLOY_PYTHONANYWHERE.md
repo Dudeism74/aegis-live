@@ -25,7 +25,7 @@ not schedule the old endless-loop configuration every five minutes.
 Before restart, run:
 
 ```text
-.venv/bin/python -m unittest discover -v
+.venv/bin/python -m pytest -q
 ```
 
 The bot defaults to paper mode. Do not add the live authorization variables.

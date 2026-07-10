@@ -3,5 +3,5 @@ gspread
 numpy
 pandas
 python-dotenv
+pytest
 ta
-
