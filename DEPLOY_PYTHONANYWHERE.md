@@ -6,7 +6,14 @@ outside version control. Back them up before replacing the deployed code.
 Set `AEGIS_STRATEGY_CAPITAL=3600` in `.env`. This prevents Alpaca's much larger
 paper-account equity from inflating the strategy's intended position sizes.
 
-## Preferred: Always-on Task
+## Choose exactly one operating model
+
+The always-on process and the five-minute scheduled task are mutually
+exclusive. Do not configure both. Both models use the same process lock, which
+is released on normal exit and exceptions. It blocks overlapping persistent
+instances without preventing later scheduled runs after an earlier run exits.
+
+## Model 1: always-on process
 
 Run one persistent process:
 
@@ -14,13 +21,25 @@ Run one persistent process:
 cd ~/aegis-live && .venv/bin/python main.py
 ```
 
-Set `AEGIS_RUN_ONCE=false`. The process lock exits with status 2 if another copy
-is already active.
+Set:
 
-## Alternative: scheduled every five minutes
+```text
+AEGIS_RUN_ONCE=false
+AEGIS_CYCLE_SECONDS=300
+```
 
-Set `AEGIS_RUN_ONCE=true` so each invocation performs one cycle and exits. Do
-not schedule the old endless-loop configuration every five minutes.
+The process lock exits with status 2 if another copy is already active.
+
+## Model 2: scheduled every five minutes
+
+Set:
+
+```text
+AEGIS_RUN_ONCE=true
+```
+
+Each invocation performs one cycle, releases the lock, and exits. Do not set
+`AEGIS_RUN_ONCE=false` in a task scheduled every five minutes.
 
 Before restart, run:
 

@@ -5,6 +5,8 @@ credentials.json
 *.sqlite3-wal
 .aegis.lock
 __pycache__/
+*.pyc
 .pytest_cache/
+.venv/
+venv/
 Aegis Trading Log - Sheet1.csv
-

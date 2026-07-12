@@ -130,7 +130,7 @@ def ensure_dashboard_ticker(gc: Any, ticker: str) -> None:
         return
     try:
         dashboard = sheets_retry(lambda: gc.open("Aegis Trading Log").worksheet("Dashboard"))
-        tickers = dashboard.col_values(1)
+        tickers = sheets_retry(lambda: dashboard.col_values(1))
         ticker = ticker.strip().upper()
         if ticker in {value.strip().upper() for value in tickers}:
             return
@@ -180,7 +180,10 @@ class Scanner:
         symbol, side = order["symbol"], order["side"]
         signal_price = float(order["signal_price"] or 0)
         slippage = fill_price - signal_price if signal_price else 0.0
-        slippage_pct = slippage / signal_price * 100 if signal_price else 0.0
+        # Sheet1 formats Slippage (%) as a percentage, so store the decimal
+        # ratio. The sign remains fill minus signal for both sides: positive
+        # means a higher fill, and negative means a lower fill.
+        slippage_pct = slippage / signal_price if signal_price else 0.0
         account_value = float(self.trading.get_account().portfolio_value)
         rsi, lower_band = float(order["rsi"] or 0), float(order["lower_band"] or 0)
         rsi_depth = lower_band - rsi
