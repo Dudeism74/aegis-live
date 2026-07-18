@@ -4,4 +4,5 @@ numpy
 pandas
 python-dotenv
 pytest
+requests
 ta
