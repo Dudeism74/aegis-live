@@ -23,7 +23,8 @@ def check_rsi_buy_signal(data_client, symbol):
       2. RSI_7 < Lower Band    (statistically oversold)
       3. Close > Open          (intraday bounce confirmation)
 
-    Returns dict: {is_buy, rsi_7, lower_band, atr_14}
+    Returns the indicator values and individual gate results so research sensors
+    can record why a setup passed or failed without changing trade authority.
     Returns None on insufficient data or unrecoverable error.
     """
     try:
@@ -83,11 +84,9 @@ def check_rsi_buy_signal(data_client, symbol):
             return None
 
         # --- Logic Gates ---
-        above_kama      = current_close > current_kama
-        rsi_oversold    = current_rsi_7 < current_lower_band
-        intraday_bounce = current_close > current_open
-        # Normalize NumPy boolean scalars so callers and serialized telemetry
-        # always receive a regular Python bool.
+        above_kama      = bool(current_close > current_kama)
+        rsi_oversold    = bool(current_rsi_7 < current_lower_band)
+        intraday_bounce = bool(current_close > current_open)
         is_buy          = bool(above_kama and rsi_oversold and intraday_bounce)
 
         if is_buy:
@@ -102,10 +101,16 @@ def check_rsi_buy_signal(data_client, symbol):
             )
 
         return {
-            "is_buy":     is_buy,
-            "rsi_7":      float(current_rsi_7),
+            "is_buy": is_buy,
+            "rsi_7": float(current_rsi_7),
             "lower_band": float(current_lower_band),
-            "atr_14":     float(current_atr),
+            "atr_14": float(current_atr),
+            "close": float(current_close),
+            "open": float(current_open),
+            "kama": float(current_kama),
+            "above_kama": above_kama,
+            "rsi_oversold": rsi_oversold,
+            "intraday_bounce": intraday_bounce,
         }
 
     except Exception as e:
