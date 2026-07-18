@@ -6,16 +6,32 @@ import csv
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
 FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired"}
+REDDIT_SHEET_HEADERS = [
+    "Signal ID", "Observed At UTC", "Ticker", "Subreddits", "Sentiment Score",
+    "Mention Count", "Weighted Mentions", "Baseline Mentions", "Mention Spike Ratio",
+    "Positive Reddit Signal", "Price at Signal", "Technical Check Run", "Technical Pass",
+    "Above KAMA", "RSI Oversold", "Intraday Bounce", "RSI 7", "RSI Lower Band",
+    "KAMA", "ATR 14", "Market Direction", "SPY Realized Volatility", "Sample Posts",
+    "Price 1h", "Return 1h", "1h Observed At UTC", "Price 24h", "Return 24h",
+    "24h Observed At UTC", "Price 120h", "Return 120h", "120h Observed At UTC",
+    "Last Updated UTC",
+]
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _yes_no(value: Any) -> str:
+    if value is None:
+        return ""
+    return "YES" if bool(value) else "NO"
 
 
 class Ledger:
@@ -85,6 +101,67 @@ class Ledger:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reddit_observations (
+                    observed_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    sentiment_score REAL NOT NULL,
+                    mention_count INTEGER NOT NULL,
+                    weighted_mentions REAL NOT NULL,
+                    baseline_mentions REAL NOT NULL,
+                    spike_ratio REAL NOT NULL,
+                    PRIMARY KEY(observed_at, symbol)
+                );
+                CREATE INDEX IF NOT EXISTS idx_reddit_observations_symbol_time
+                    ON reddit_observations(symbol, observed_at DESC);
+                CREATE TABLE IF NOT EXISTS reddit_signals (
+                    signal_id TEXT PRIMARY KEY,
+                    observed_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    subreddits TEXT NOT NULL,
+                    sentiment_score REAL NOT NULL,
+                    mention_count INTEGER NOT NULL,
+                    weighted_mentions REAL NOT NULL,
+                    baseline_mentions REAL NOT NULL,
+                    baseline_samples INTEGER NOT NULL,
+                    spike_ratio REAL NOT NULL,
+                    price_at_signal REAL NOT NULL,
+                    technical_checked INTEGER NOT NULL,
+                    technical_pass INTEGER,
+                    above_kama INTEGER,
+                    rsi_oversold INTEGER,
+                    intraday_bounce INTEGER,
+                    rsi REAL,
+                    lower_band REAL,
+                    kama REAL,
+                    atr REAL,
+                    market_direction TEXT,
+                    realized_vol REAL,
+                    sample_posts_json TEXT NOT NULL,
+                    price_1h REAL,
+                    return_1h REAL,
+                    observed_1h_at TEXT,
+                    price_24h REAL,
+                    return_24h REAL,
+                    observed_24h_at TEXT,
+                    price_120h REAL,
+                    return_120h REAL,
+                    observed_120h_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_reddit_signals_symbol_time
+                    ON reddit_signals(symbol, observed_at DESC);
+                CREATE TABLE IF NOT EXISTS reddit_sheet_queue (
+                    queue_id TEXT PRIMARY KEY,
+                    signal_id TEXT NOT NULL,
+                    row_json TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    synced_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_reddit_sheet_queue_unsynced
+                    ON reddit_sheet_queue(synced_at, created_at);
                 """
             )
 
@@ -280,3 +357,180 @@ class Ledger:
             return False
         self.save_position(symbol, None, entry_price, qty, atr, latest[0])
         return True
+
+    def record_reddit_observation(
+        self, *, observed_at: str, symbol: str, sentiment_score: float,
+        mention_count: int, weighted_mentions: float, baseline_mentions: float,
+        spike_ratio: float,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO reddit_observations
+                (observed_at, symbol, sentiment_score, mention_count, weighted_mentions,
+                 baseline_mentions, spike_ratio)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observed_at, symbol.upper(), float(sentiment_score), int(mention_count),
+                    float(weighted_mentions), float(baseline_mentions), float(spike_ratio),
+                ),
+            )
+
+    def reddit_baseline_mentions(self, symbol: str, limit: int = 12) -> tuple[float, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT mention_count FROM reddit_observations WHERE symbol=? "
+                "ORDER BY observed_at DESC LIMIT ?",
+                (symbol.upper(), max(1, int(limit))),
+            ).fetchall()
+        if not rows:
+            return 0.0, 0
+        return sum(float(row[0]) for row in rows) / len(rows), len(rows)
+
+    def has_recent_reddit_signal(self, symbol: str, observed_at: str, cooldown_minutes: int) -> bool:
+        try:
+            cutoff = datetime.fromisoformat(observed_at.replace("Z", "+00:00")) - timedelta(
+                minutes=max(0, int(cooldown_minutes))
+            )
+        except ValueError:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(0, int(cooldown_minutes)))
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM reddit_signals WHERE symbol=? AND observed_at>=? LIMIT 1",
+                (symbol.upper(), cutoff.isoformat()),
+            ).fetchone()
+        return row is not None
+
+    def _reddit_row(self, signal: sqlite3.Row) -> list[Any]:
+        try:
+            samples = json.loads(signal["sample_posts_json"] or "[]")
+        except json.JSONDecodeError:
+            samples = []
+        return [
+            signal["signal_id"], signal["observed_at"], signal["symbol"], signal["subreddits"],
+            round(float(signal["sentiment_score"]), 4), int(signal["mention_count"]),
+            round(float(signal["weighted_mentions"]), 4), round(float(signal["baseline_mentions"]), 4),
+            round(float(signal["spike_ratio"]), 4), "YES", round(float(signal["price_at_signal"]), 4),
+            _yes_no(signal["technical_checked"]), _yes_no(signal["technical_pass"]),
+            _yes_no(signal["above_kama"]), _yes_no(signal["rsi_oversold"]),
+            _yes_no(signal["intraday_bounce"]),
+            "" if signal["rsi"] is None else round(float(signal["rsi"]), 4),
+            "" if signal["lower_band"] is None else round(float(signal["lower_band"]), 4),
+            "" if signal["kama"] is None else round(float(signal["kama"]), 4),
+            "" if signal["atr"] is None else round(float(signal["atr"]), 4),
+            signal["market_direction"] or "N/A",
+            "" if signal["realized_vol"] is None else round(float(signal["realized_vol"]), 4),
+            "\n".join(str(item) for item in samples),
+            "" if signal["price_1h"] is None else round(float(signal["price_1h"]), 4),
+            "" if signal["return_1h"] is None else round(float(signal["return_1h"]), 6),
+            signal["observed_1h_at"] or "",
+            "" if signal["price_24h"] is None else round(float(signal["price_24h"]), 4),
+            "" if signal["return_24h"] is None else round(float(signal["return_24h"]), 6),
+            signal["observed_24h_at"] or "",
+            "" if signal["price_120h"] is None else round(float(signal["price_120h"]), 4),
+            "" if signal["return_120h"] is None else round(float(signal["return_120h"]), 6),
+            signal["observed_120h_at"] or "", signal["updated_at"],
+        ]
+
+    def _queue_reddit_signal(self, conn: sqlite3.Connection, signal_id: str) -> None:
+        signal = conn.execute("SELECT * FROM reddit_signals WHERE signal_id=?", (signal_id,)).fetchone()
+        if signal is None:
+            raise KeyError(f"Unknown Reddit signal {signal_id}")
+        conn.execute(
+            "INSERT INTO reddit_sheet_queue(queue_id, signal_id, row_json, created_at) VALUES (?, ?, ?, ?)",
+            (uuid.uuid4().hex, signal_id, json.dumps(self._reddit_row(signal), default=str), utc_now()),
+        )
+
+    def add_reddit_signal(self, values: dict[str, Any]) -> str:
+        signal_id = str(values.get("signal_id") or uuid.uuid4().hex)
+        now = utc_now()
+        record = {
+            "signal_id": signal_id,
+            "observed_at": str(values["observed_at"]),
+            "symbol": str(values["symbol"]).upper(),
+            "subreddits": ", ".join(values.get("subreddits") or []),
+            "sentiment_score": float(values["sentiment_score"]),
+            "mention_count": int(values["mention_count"]),
+            "weighted_mentions": float(values["weighted_mentions"]),
+            "baseline_mentions": float(values.get("baseline_mentions") or 0),
+            "baseline_samples": int(values.get("baseline_samples") or 0),
+            "spike_ratio": float(values.get("spike_ratio") or 0),
+            "price_at_signal": float(values["price_at_signal"]),
+            "technical_checked": 1 if values.get("technical_checked") else 0,
+            "technical_pass": None if values.get("technical_pass") is None else (1 if values.get("technical_pass") else 0),
+            "above_kama": None if values.get("above_kama") is None else (1 if values.get("above_kama") else 0),
+            "rsi_oversold": None if values.get("rsi_oversold") is None else (1 if values.get("rsi_oversold") else 0),
+            "intraday_bounce": None if values.get("intraday_bounce") is None else (1 if values.get("intraday_bounce") else 0),
+            "rsi": values.get("rsi"),
+            "lower_band": values.get("lower_band"),
+            "kama": values.get("kama"),
+            "atr": values.get("atr"),
+            "market_direction": values.get("market_direction"),
+            "realized_vol": values.get("realized_vol"),
+            "sample_posts_json": json.dumps(list(values.get("sample_posts") or [])),
+            "created_at": now,
+            "updated_at": now,
+        }
+        columns = ", ".join(record)
+        placeholders = ", ".join(f":{name}" for name in record)
+        with self.connect() as conn:
+            conn.execute(f"INSERT INTO reddit_signals ({columns}) VALUES ({placeholders})", record)
+            self._queue_reddit_signal(conn, signal_id)
+        return signal_id
+
+    def reddit_signals_needing_outcomes(self, limit: int = 200) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM reddit_signals WHERE return_1h IS NULL OR return_24h IS NULL "
+                "OR return_120h IS NULL ORDER BY observed_at LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+
+    def update_reddit_outcome(
+        self, signal_id: str, horizon: str, price: float, observed_at: str,
+    ) -> None:
+        mapping = {
+            "1h": ("price_1h", "return_1h", "observed_1h_at"),
+            "24h": ("price_24h", "return_24h", "observed_24h_at"),
+            "120h": ("price_120h", "return_120h", "observed_120h_at"),
+        }
+        if horizon not in mapping:
+            raise ValueError(f"Unsupported Reddit outcome horizon: {horizon}")
+        price_column, return_column, observed_column = mapping[horizon]
+        with self.connect() as conn:
+            signal = conn.execute(
+                "SELECT price_at_signal FROM reddit_signals WHERE signal_id=?", (signal_id,)
+            ).fetchone()
+            if signal is None:
+                raise KeyError(f"Unknown Reddit signal {signal_id}")
+            initial = float(signal["price_at_signal"])
+            realized_return = float(price) / initial - 1 if initial else 0.0
+            conn.execute(
+                f"UPDATE reddit_signals SET {price_column}=?, {return_column}=?, {observed_column}=?, "
+                "updated_at=? WHERE signal_id=?",
+                (float(price), realized_return, observed_at, utc_now(), signal_id),
+            )
+            self._queue_reddit_signal(conn, signal_id)
+
+    def unsynced_reddit_rows(self, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM reddit_sheet_queue WHERE synced_at IS NULL "
+                "ORDER BY created_at, rowid LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+
+    def mark_reddit_synced(self, queue_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE reddit_sheet_queue SET synced_at=?, last_error=NULL WHERE queue_id=?",
+                (utc_now(), queue_id),
+            )
+
+    def mark_reddit_sync_failed(self, queue_id: str, error: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE reddit_sheet_queue SET attempts=attempts+1, last_error=? WHERE queue_id=?",
+                (str(error)[:1000], queue_id),
+            )
