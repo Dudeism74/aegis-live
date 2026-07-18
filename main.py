@@ -8,7 +8,7 @@ import os
 import smtplib
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -26,8 +26,9 @@ import strategy
 from execution import reconcile_pending_orders, submit_order, wait_for_final_order
 from instance_lock import AlreadyRunningError, InstanceLock
 from ledger import FINAL_ORDER_STATUSES, Ledger
+from reddit_sensor import RedditSensor
 from sheet_sync import retry as sheets_retry
-from sheet_sync import sync_trade_queue
+from sheet_sync import sync_reddit_queue, sync_trade_queue
 
 try:
     import zoneinfo
@@ -159,6 +160,7 @@ class Scanner:
         self.realized_vol: float | None = None
         self.market_direction = "N/A"
         self.trade_messages: list[str] = []
+        self.reddit_sensor = RedditSensor.from_env(ledger, TICKERS)
 
     def price(self, symbol: str) -> float:
         snapshot = self.data.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
@@ -293,6 +295,93 @@ class Scanner:
             if response:
                 self.finalize_order(wait_for_final_order(self.trading, self.ledger, str(response.id)))
 
+    def update_reddit_outcomes(self, now: datetime) -> None:
+        now_utc = now.astimezone(timezone.utc)
+        for signal in self.ledger.reddit_signals_needing_outcomes():
+            try:
+                observed = datetime.fromisoformat(str(signal["observed_at"]).replace("Z", "+00:00"))
+            except ValueError:
+                logging.error("Reddit signal %s has an invalid timestamp", signal["signal_id"])
+                continue
+            due: list[str] = []
+            if signal["return_1h"] is None and now_utc >= observed + timedelta(hours=1):
+                due.append("1h")
+            if signal["return_24h"] is None and now_utc >= observed + timedelta(hours=24):
+                due.append("24h")
+            if signal["return_120h"] is None and now_utc >= observed + timedelta(hours=120):
+                due.append("120h")
+            if not due:
+                continue
+            try:
+                current = self.price(str(signal["symbol"]))
+            except Exception as exc:
+                logging.error("Could not price Reddit outcome for %s: %s", signal["symbol"], exc)
+                continue
+            for horizon in due:
+                self.ledger.update_reddit_outcome(
+                    str(signal["signal_id"]), horizon, current, now_utc.isoformat()
+                )
+
+    def scan_reddit_research(self, now: datetime) -> None:
+        """Run technical checks only after a positive Reddit signal, then log it."""
+        if self.reddit_sensor is None:
+            return
+        now_utc = now.astimezone(timezone.utc)
+        last_scan_text = self.ledger.get_metadata("last_reddit_scan_at")
+        interval = max(300, int(os.getenv("AEGIS_REDDIT_SCAN_SECONDS", "900")))
+        if last_scan_text:
+            try:
+                last_scan = datetime.fromisoformat(last_scan_text.replace("Z", "+00:00"))
+                if (now_utc - last_scan).total_seconds() < interval:
+                    return
+            except ValueError:
+                logging.warning("Ignoring invalid last_reddit_scan_at metadata")
+        try:
+            signals = self.reddit_sensor.scan(now_utc)
+            self.ledger.set_metadata("last_reddit_scan_at", now_utc.isoformat())
+        except Exception as exc:
+            logging.exception("Reddit sensor scan failed: %s", exc)
+            return
+
+        for signal in signals:
+            indic = strategy.check_rsi_buy_signal(self.data, signal.symbol)
+            try:
+                signal_price = self.price(signal.symbol)
+            except Exception as exc:
+                logging.error("Could not price positive Reddit signal for %s: %s", signal.symbol, exc)
+                continue
+            technical_checked = indic is not None
+            technical_pass = bool(indic["is_buy"]) if indic else None
+            signal_id = self.ledger.add_reddit_signal({
+                "observed_at": signal.observed_at,
+                "symbol": signal.symbol,
+                "subreddits": signal.subreddits,
+                "sentiment_score": signal.sentiment_score,
+                "mention_count": signal.mention_count,
+                "weighted_mentions": signal.weighted_mentions,
+                "baseline_mentions": signal.baseline_mentions,
+                "baseline_samples": signal.baseline_samples,
+                "spike_ratio": signal.spike_ratio,
+                "price_at_signal": signal_price,
+                "technical_checked": technical_checked,
+                "technical_pass": technical_pass,
+                "above_kama": indic.get("above_kama") if indic else None,
+                "rsi_oversold": indic.get("rsi_oversold") if indic else None,
+                "intraday_bounce": indic.get("intraday_bounce") if indic else None,
+                "rsi": indic.get("rsi_7") if indic else None,
+                "lower_band": indic.get("lower_band") if indic else None,
+                "kama": indic.get("kama") if indic else None,
+                "atr": indic.get("atr_14") if indic else None,
+                "market_direction": self.market_direction,
+                "realized_vol": self.realized_vol,
+                "sample_posts": signal.sample_posts,
+            })
+            logging.info(
+                "Reddit research signal %s %s sentiment=%.3f mentions=%d spike=%.2f technical_pass=%s; no trade authority",
+                signal_id, signal.symbol, signal.sentiment_score, signal.mention_count,
+                signal.spike_ratio, technical_pass,
+            )
+
     def entry_window_open(self, now: datetime) -> bool:
         start = os.getenv("AEGIS_ENTRY_WINDOW_START", "15:45")
         end = os.getenv("AEGIS_ENTRY_WINDOW_END", "15:55")
@@ -378,15 +467,19 @@ class Scanner:
             self.gc = google_client()
         self.reconcile()
         sync_trade_queue(self.gc, self.ledger, ensure_dashboard_ticker)
+        sync_reddit_queue(self.gc, self.ledger)
         if not self.trading.get_clock().is_open:
             logging.info("Market closed")
             return
         now = datetime.now(EASTERN)
         self.realized_vol = risk_manager.get_spy_realized_volatility_20d(self.data)
         self.market_direction = risk_manager.get_market_direction(self.data)
+        self.update_reddit_outcomes(now)
+        self.scan_reddit_research(now)
         self.manage_exits()
         recap = self.scan_entries(now)
         sync_trade_queue(self.gc, self.ledger, ensure_dashboard_ticker)
+        sync_reddit_queue(self.gc, self.ledger)
         if self.trade_messages:
             send_email("Aegis Trade Alert", "\n".join(self.trade_messages))
         self.daily_recap(now, recap)
