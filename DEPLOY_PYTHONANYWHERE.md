@@ -3,8 +3,18 @@
 Keep `.env`, `credentials.json`, the historical CSV, and `aegis_ledger.sqlite3`
 outside version control. Back them up before replacing the deployed code.
 
-Set `AEGIS_STRATEGY_CAPITAL=3600` in `.env`. This prevents Alpaca's much larger
-paper-account equity from inflating the strategy's intended position sizes.
+Keep these paper-trading safeguards in `.env`:
+
+```text
+AEGIS_TRADING_MODE=paper
+AEGIS_STRATEGY_CAPITAL=3600
+AEGIS_LIVE_AUTHORIZED=false
+```
+
+The strategy-capital limit prevents Alpaca's much larger paper-account equity
+from inflating the intended position sizes. Live mode remains blocked unless
+explicit authorization is true and the configured approved account matches the
+runtime account. Do not add live account identifiers to source control.
 
 ## Choose exactly one operating model
 

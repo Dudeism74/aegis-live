@@ -105,6 +105,15 @@ def test_live_authorization_defaults_false(monkeypatch):
     assert main.env_bool("AEGIS_LIVE_AUTHORIZED") is False
 
 
+def test_live_mode_requires_matching_account_even_when_authorized(monkeypatch):
+    monkeypatch.setenv("AEGIS_TRADING_MODE", "live")
+    monkeypatch.setenv("AEGIS_LIVE_AUTHORIZED", "true")
+    monkeypatch.setenv("AEGIS_APPROVED_LIVE_ACCOUNT_ID", "approved-account")
+    monkeypatch.setenv("APCA_ACCOUNT_ID", "different-account")
+    with pytest.raises(RuntimeError):
+        main.validate_trading_mode()
+
+
 def test_ledger_freezes_entry_exits(tmp_path):
     ledger = Ledger(tmp_path / "ledger.db")
     ledger.save_position("AMD", "o1", 100, 5, 4)
@@ -368,6 +377,21 @@ def test_sheet_sync_deduplicates_event_id_after_restart(tmp_path):
     gc = SimpleNamespace(open=lambda _name: SimpleNamespace(worksheet=lambda _tab: sheet))
     assert sync_trade_queue(gc, ledger) == 1
     assert not ledger.unsynced_rows()
+
+
+def test_repeated_sheet_sync_appends_event_once(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    submitted(ledger, status="filled")
+    ledger.add_trade_event("1", ["date", "AMD", "BUY", ""])
+    appended = []
+    sheet = SimpleNamespace(
+        col_values=lambda _column: [row[-1] for row in appended],
+        append_row=lambda row: appended.append(row),
+    )
+    gc = SimpleNamespace(open=lambda _name: SimpleNamespace(worksheet=lambda _tab: sheet))
+    assert sync_trade_queue(gc, ledger) == 1
+    assert sync_trade_queue(gc, ledger) == 0
+    assert len(appended) == 1
 
 
 def test_realized_vol_failure_returns_none(monkeypatch):

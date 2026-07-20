@@ -8,7 +8,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired"}
