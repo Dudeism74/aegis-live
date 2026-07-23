@@ -105,3 +105,19 @@ https://www.proshares.com/our-etfs/leveraged-and-inverse/psq
 
 Do not disable the overlay while PSQ is open without first closing or manually
 reconciling that hedge. Restart the always-on process after changing `.env`.
+
+## Paper trading report card
+
+Aegis creates a `Report Card` tab in the existing `Aegis Trading Log`
+workbook. It uses only confirmed SELL events with a Ledger Event ID and leaves
+the 34-column `Sheet1` layout unchanged.
+
+The card separately grades win rate, expectancy in R, profit factor, maximum
+realized drawdown, and net realized PSQ hedge cost. Grades remain `N/A` until
+30 completed strategy exits. A paper-readiness result requires at least 50
+completed strategy exits and every graded metric at C or better. This result is
+an evaluation gate only; it never changes the paper-only safeguards or
+authorizes live trading.
+
+Hedge cost covers realized PSQ profit or loss only. It does not include an open
+hedge's unrealized result, commissions, taxes, or opportunity cost.

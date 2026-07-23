@@ -33,7 +33,7 @@ from instance_lock import AlreadyRunningError, InstanceLock
 from ledger import FINAL_ORDER_STATUSES, Ledger
 from reddit_sensor import RedditSensor
 from sheet_sync import retry as sheets_retry
-from sheet_sync import sync_reddit_queue, sync_trade_queue
+from sheet_sync import ensure_report_card, sync_reddit_queue, sync_trade_queue
 
 try:
     import zoneinfo
@@ -180,6 +180,7 @@ class Scanner:
         self.risk_state = RISK_NORMAL if self.hedge_config.mode == "off" else RISK_UNKNOWN
         self.trade_messages: list[str] = []
         self.reddit_sensor = RedditSensor.from_env(ledger, TICKERS)
+        self.report_card_ready = False
 
     def price(self, symbol: str) -> float:
         snapshot = self.data.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))[symbol]
@@ -697,6 +698,12 @@ class Scanner:
         self.trade_messages = []
         if self.gc is None:
             self.gc = google_client()
+        if not self.report_card_ready:
+            self.report_card_ready = ensure_report_card(
+                self.gc,
+                strategy_capital=float(os.getenv("AEGIS_STRATEGY_CAPITAL", "3600")),
+                hedge_symbol=self.hedge_config.symbol,
+            )
         self.reconcile()
         sync_trade_queue(self.gc, self.ledger, ensure_dashboard_ticker)
         sync_reddit_queue(self.gc, self.ledger)

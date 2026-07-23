@@ -16,7 +16,13 @@ import risk_manager
 import strategy
 from instance_lock import AlreadyRunningError, InstanceLock
 from ledger import Ledger
-from sheet_sync import retry, sync_trade_queue
+from sheet_sync import (
+    REPORT_CARD_VERSION,
+    build_report_card_rows,
+    ensure_report_card,
+    retry,
+    sync_trade_queue,
+)
 
 
 class AccountClient:
@@ -555,6 +561,46 @@ def test_repeated_sheet_sync_appends_event_once(tmp_path):
     assert sync_trade_queue(gc, ledger) == 1
     assert sync_trade_queue(gc, ledger) == 0
     assert len(appended) == 1
+
+
+def test_report_card_grades_confirmed_strategy_and_hedge_results():
+    rows = build_report_card_rows(3600, "PSQ")
+    assert len(rows) == 17
+    assert rows[4][1] == (
+        '=COUNTIFS(Sheet1!C$2:C,"SELL",Sheet1!AH$2:AH,"<>",'
+        'Sheet1!B$2:B,"<>PSQ")'
+    )
+    assert 'Sheet1!R$2:R*Sheet1!H$2:H' in rows[6][1]
+    assert 'Sheet1!B$2:B,"PSQ"' in rows[9][1]
+    assert "INSUFFICIENT DATA" in rows[10][1]
+    assert "PAPER PASS" in rows[10][1]
+
+
+def test_report_card_sheet_update_uses_formulas_and_version_marker():
+    updates = []
+    marker_updates = []
+    sheet = SimpleNamespace(
+        acell=lambda _cell: SimpleNamespace(value=""),
+        update=lambda **kwargs: updates.append(kwargs),
+        update_acell=lambda cell, value: marker_updates.append((cell, value)),
+    )
+    workbook = SimpleNamespace(worksheet=lambda _tab: sheet)
+    gc = SimpleNamespace(open=lambda _name: workbook)
+    assert ensure_report_card(gc, 3600, "PSQ")
+    assert updates[0]["range_name"] == "A1:F17"
+    assert updates[0]["value_input_option"] == "USER_ENTERED"
+    assert updates[0]["values"][5][0] == "Win Rate"
+    assert marker_updates == [("F30", REPORT_CARD_VERSION)]
+
+
+def test_current_report_card_version_skips_rewrite():
+    sheet = SimpleNamespace(
+        acell=lambda _cell: SimpleNamespace(value=REPORT_CARD_VERSION),
+        update=lambda **_kwargs: pytest.fail("current template must not be rewritten"),
+    )
+    workbook = SimpleNamespace(worksheet=lambda _tab: sheet)
+    gc = SimpleNamespace(open=lambda _name: workbook)
+    assert ensure_report_card(gc)
 
 
 def test_market_day_returns_use_current_and_previous_snapshot_closes():
