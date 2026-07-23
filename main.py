@@ -24,6 +24,11 @@ import portfolio
 import risk_manager
 import strategy
 from execution import reconcile_pending_orders, submit_order, wait_for_final_order
+from hedge import (
+    RISK_NORMAL,
+    RISK_UNKNOWN,
+    HedgeConfig,
+)
 from instance_lock import AlreadyRunningError, InstanceLock
 from ledger import FINAL_ORDER_STATUSES, Ledger
 from reddit_sensor import RedditSensor
@@ -75,6 +80,14 @@ def validate_trading_mode() -> bool:
         return False
     logging.info("Aegis trading mode: PAPER")
     return True
+
+
+def validate_hedge_mode(paper: bool, config: HedgeConfig) -> None:
+    """Block the active hedge overlay from ever operating in a live account."""
+    if config.mode == "paper" and not paper:
+        raise RuntimeError(
+            "Active hedge mode is paper-only; set AEGIS_HEDGE_MODE=off or observe"
+        )
 
 
 def send_email(subject: str, body: str) -> None:
@@ -151,7 +164,10 @@ def ensure_dashboard_ticker(gc: Any, ticker: str) -> None:
 
 
 class Scanner:
-    def __init__(self, trading_client: Any, data_client: Any, gc: Any, ledger: Ledger):
+    def __init__(
+        self, trading_client: Any, data_client: Any, gc: Any, ledger: Ledger,
+        hedge_config: HedgeConfig | None = None,
+    ):
         self.trading, self.data, self.gc, self.ledger = trading_client, data_client, gc, ledger
         entry_date = ledger.get_metadata("last_entry_date")
         recap_date = ledger.get_metadata("last_recap_date")
@@ -159,6 +175,9 @@ class Scanner:
         self.last_recap_date = datetime.fromisoformat(recap_date).date() if recap_date else None
         self.realized_vol: float | None = None
         self.market_direction = "N/A"
+        self.hedge_config = hedge_config or HedgeConfig.from_env()
+        self.market_returns: dict[str, float] = {}
+        self.risk_state = RISK_NORMAL if self.hedge_config.mode == "off" else RISK_UNKNOWN
         self.trade_messages: list[str] = []
         self.reddit_sensor = RedditSensor.from_env(ledger, TICKERS)
 
@@ -189,11 +208,61 @@ class Scanner:
         account_value = float(self.trading.get_account().portfolio_value)
         rsi, lower_band = float(order["rsi"] or 0), float(order["lower_band"] or 0)
         rsi_depth = lower_band - rsi
+        order_role = str(order["order_role"] or "strategy").lower()
+        if order_role not in {"strategy", "hedge"}:
+            logging.error("Order %s has unknown role %s", order["order_id"], order_role)
+            return
         entry_atr = float(order["entry_atr"] or 0)
         realized_return = realized_pnl = 0.0
         outcome, hold = "", "N/A"
 
-        if side == "buy":
+        if order_role == "hedge" and side == "buy":
+            existing = self.ledger.get_hedge_position(symbol)
+            if existing:
+                old_qty = float(existing["entry_qty"])
+                combined_qty = old_qty + filled_qty
+                combined_price = (
+                    (float(existing["entry_price"]) * old_qty)
+                    + (fill_price * filled_qty)
+                ) / combined_qty
+                opened_at = str(existing["opened_at"])
+                entry_order_id = str(existing["entry_order_id"] or order["order_id"])
+            else:
+                combined_qty = filled_qty
+                combined_price = fill_price
+                opened_at = order["completed_at"] or order["submitted_at"]
+                entry_order_id = order["order_id"]
+            self.ledger.save_hedge_position(
+                symbol, entry_order_id, combined_price, combined_qty, opened_at
+            )
+            entry_atr = stop_price = target_price = 0.0
+        elif order_role == "hedge" and side == "sell":
+            position = self.ledger.get_hedge_position(symbol)
+            if position is None:
+                logging.error(
+                    "Filled hedge SELL %s has no local entry; manual reconciliation required",
+                    symbol,
+                )
+                send_email(
+                    "Aegis hedge ledger error",
+                    f"Filled hedge SELL {symbol} lacks a local entry; inspect {order['order_id']}.",
+                )
+                return
+            entry_price = float(position["entry_price"])
+            realized_return = fill_price / entry_price - 1
+            realized_pnl = (fill_price - entry_price) * filled_qty
+            outcome = "WIN" if realized_pnl > 0 else "LOSS"
+            hold = duration_text(position["opened_at"], order["completed_at"])
+            remaining = max(0.0, float(position["entry_qty"]) - filled_qty)
+            if remaining > 0.000001:
+                self.ledger.save_hedge_position(
+                    symbol, position["entry_order_id"], entry_price, remaining,
+                    position["opened_at"],
+                )
+            else:
+                self.ledger.close_hedge_position(symbol)
+            entry_atr = stop_price = target_price = 0.0
+        elif side == "buy":
             if entry_atr <= 0:
                 logging.error("Filled BUY %s has no valid entry ATR; refusing to invent exits", symbol)
                 send_email("Aegis ledger error", f"Filled BUY {symbol} lacks entry ATR; inspect {order['order_id']}.")
@@ -241,7 +310,11 @@ class Scanner:
         ]
         self.ledger.add_trade_event(order["order_id"], row)
         write_trade_to_csv(row)
-        message = f"{side.upper()} {filled_qty:g} {symbol} filled at ${fill_price:.4f} ({status})"
+        prefix = "HEDGE " if order_role == "hedge" else ""
+        message = (
+            f"{prefix}{side.upper()} {filled_qty:g} {symbol} "
+            f"filled at ${fill_price:.4f} ({status})"
+        )
         self.trade_messages.append(message)
         logging.info(message)
 
@@ -268,9 +341,139 @@ class Scanner:
         logging.warning("Migrated %s using current ATR because no historical row was available", symbol)
         return self.ledger.get_position(symbol)
 
+    def update_market_risk(self) -> None:
+        if self.hedge_config.mode == "off":
+            self.market_returns = {}
+            self.risk_state = RISK_NORMAL
+            return
+        returns = risk_manager.get_market_day_returns(self.data)
+        self.market_returns = returns or {}
+        self.risk_state = self.hedge_config.classify(self.market_returns.get("QQQ"))
+        qqq_text = (
+            f"{self.market_returns['QQQ']:.2%}"
+            if "QQQ" in self.market_returns else "unavailable"
+        )
+        logging.info(
+            "QQQ risk governor mode=%s state=%s session_return=%s",
+            self.hedge_config.mode, self.risk_state, qqq_text,
+        )
+
+    def _position_market_value(self, broker_position: Any) -> float:
+        market_value = getattr(broker_position, "market_value", None)
+        if market_value is not None:
+            return abs(float(market_value))
+        return abs(float(broker_position.qty)) * self.price(str(broker_position.symbol))
+
+    def _strategy_gross_long_notional(self, broker_positions: list[Any]) -> float:
+        total = 0.0
+        for position in broker_positions:
+            symbol = str(position.symbol).upper()
+            qty = float(position.qty)
+            if symbol in TICKERS and qty > 0:
+                total += self._position_market_value(position)
+        return round(total, 2)
+
+    def _hedge_broker_position(self, broker_positions: list[Any]) -> Any | None:
+        return next(
+            (
+                position for position in broker_positions
+                if str(position.symbol).upper() == self.hedge_config.symbol
+                and float(position.qty) > 0
+            ),
+            None,
+        )
+
+    def _submit_hedge_order(
+        self, *, side: str, signal_price: float, reason: str,
+        qty: float | None = None, notional: float | None = None,
+    ) -> None:
+        response = submit_order(
+            self.trading, self.ledger,
+            symbol=self.hedge_config.symbol, side=side, qty=qty, notional=notional,
+            signal_price=signal_price, entry_atr=None, rsi=None, lower_band=None,
+            realized_vol=self.realized_vol, market_direction=self.market_direction,
+            reason=reason, order_role="hedge",
+        )
+        if response:
+            self.finalize_order(
+                wait_for_final_order(self.trading, self.ledger, str(response.id))
+            )
+
+    def manage_hedge(self) -> None:
+        """Observe or rebalance the short-term PSQ overlay using confirmed fills."""
+        config = self.hedge_config
+        if config.mode == "off":
+            return
+        broker_positions = list(self.trading.get_all_positions())
+        gross_long = self._strategy_gross_long_notional(broker_positions)
+        broker_hedge = self._hedge_broker_position(broker_positions)
+        local_hedge = self.ledger.get_hedge_position(config.symbol)
+        hedge_is_open = broker_hedge is not None and local_hedge is not None
+        target = config.target_notional(gross_long, self.risk_state, hedge_is_open)
+        current = self._position_market_value(broker_hedge) if broker_hedge else 0.0
+        logging.info(
+            "Hedge assessment state=%s gross_longs=$%.2f current_%s=$%.2f target=$%.2f",
+            self.risk_state, gross_long, config.symbol, current, target,
+        )
+
+        if config.mode == "observe":
+            return
+        if self.risk_state == RISK_UNKNOWN:
+            logging.warning(
+                "QQQ risk data unavailable; preserving any hedge and refusing hedge orders"
+            )
+            return
+        if broker_hedge is not None and local_hedge is None:
+            logging.error(
+                "Broker holds %s without Aegis hedge ledger state; refusing to manage it",
+                config.symbol,
+            )
+            return
+        if broker_hedge is None and local_hedge is not None:
+            logging.error(
+                "Aegis hedge ledger contains %s but broker does not; manual reconciliation required",
+                config.symbol,
+            )
+            return
+
+        if target <= 0:
+            if broker_hedge is not None:
+                signal_price = self.price(config.symbol)
+                self._submit_hedge_order(
+                    side="sell", qty=float(broker_hedge.qty),
+                    signal_price=signal_price, reason="QQQ Risk Hedge Exit",
+                )
+            return
+
+        if not config.rebalance_required(current, target):
+            return
+        difference = target - current
+        if difference > 0:
+            if broker_hedge is not None:
+                logging.info(
+                    "Existing %s hedge is below target; not averaging down",
+                    config.symbol,
+                )
+                return
+            signal_price = self.price(config.symbol)
+            self._submit_hedge_order(
+                side="buy", notional=round(difference, 2),
+                signal_price=signal_price, reason="QQQ Risk Hedge",
+            )
+            return
+        signal_price = self.price(config.symbol)
+        qty = min(float(broker_hedge.qty), abs(difference) / signal_price)
+        if qty > 0.000001:
+            self._submit_hedge_order(
+                side="sell", qty=round(qty, 6),
+                signal_price=signal_price, reason="QQQ Risk Hedge Rebalance",
+            )
+
     def manage_exits(self) -> None:
         for broker_position in self.trading.get_all_positions():
             symbol = broker_position.symbol
+            if str(symbol).upper() == self.hedge_config.symbol:
+                continue
             position = self.ensure_position_state(broker_position)
             if position is None:
                 continue
@@ -389,13 +592,35 @@ class Scanner:
         return start <= current <= end and self.last_entry_date != now.date()
 
     def scan_entries(self, now: datetime) -> dict[str, Any]:
-        recap = {"rsi": [], "blocked": [], "closest": None, "margin": float("inf"), "reason": "N/A"}
+        recap = {
+            "rsi": [], "blocked": [], "closest": None, "margin": float("inf"),
+            "reason": "N/A", "risk_state": self.risk_state,
+            "qqq_return": self.market_returns.get("QQQ"),
+        }
         if not self.entry_window_open(now):
             return recap
         observation = risk_manager.observe_vix_term_structure(self.data)
         if observation:
             logging.info("Observe-only VIXY/VXZ z-score: %.3f (does not block trades)", observation["zscore"])
-        owned = {p.symbol for p in self.trading.get_all_positions()}
+        exposure_factor = self.hedge_config.entry_exposure_factor(self.risk_state)
+        if exposure_factor <= 0:
+            recap["reason"] = (
+                "QQQ Risk Data Unavailable"
+                if self.risk_state == RISK_UNKNOWN
+                else "QQQ Severe Risk-Off"
+            )
+            logging.warning(
+                "QQQ risk governor blocked all new entries: state=%s",
+                self.risk_state,
+            )
+            self.last_entry_date = now.date()
+            self.ledger.set_metadata("last_entry_date", now.date().isoformat())
+            return recap
+        broker_positions = list(self.trading.get_all_positions())
+        owned = {
+            str(position.symbol).upper() for position in broker_positions
+            if str(position.symbol).upper() in TICKERS
+        }
         for ticker in TICKERS:
             indic = strategy.check_rsi_buy_signal(self.data, ticker)
             if not indic:
@@ -411,7 +636,11 @@ class Scanner:
                 )
             if not indic["is_buy"] or ticker in owned:
                 continue
-            if len(self.trading.get_all_positions()) >= 5:
+            strategy_position_count = sum(
+                1 for position in self.trading.get_all_positions()
+                if str(position.symbol).upper() in TICKERS
+            )
+            if strategy_position_count >= 5:
                 logging.warning("Portfolio capacity reached; skipping %s", ticker)
                 continue
             signal = self.price(ticker)
@@ -419,6 +648,9 @@ class Scanner:
                 self.trading, entry_price=signal, entry_atr=float(indic["atr_14"]),
                 strategy_capital=float(os.getenv("AEGIS_STRATEGY_CAPITAL", "3600")),
             )
+            if size_usd <= 0:
+                continue
+            size_usd = round(size_usd * exposure_factor, 2)
             if size_usd <= 0:
                 continue
             response = submit_order(
@@ -474,9 +706,11 @@ class Scanner:
         now = datetime.now(EASTERN)
         self.realized_vol = risk_manager.get_spy_realized_volatility_20d(self.data)
         self.market_direction = risk_manager.get_market_direction(self.data)
+        self.update_market_risk()
         self.update_reddit_outcomes(now)
         self.scan_reddit_research(now)
         self.manage_exits()
+        self.manage_hedge()
         recap = self.scan_entries(now)
         sync_trade_queue(self.gc, self.ledger, ensure_dashboard_ticker)
         sync_reddit_queue(self.gc, self.ledger)
@@ -495,11 +729,16 @@ def google_client() -> Any | None:
 
 def run_scanner() -> None:
     paper = validate_trading_mode()
+    hedge_config = HedgeConfig.from_env()
+    validate_hedge_mode(paper, hedge_config)
     key, secret = os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY")
     if not key or not secret:
         raise RuntimeError("APCA_API_KEY_ID and APCA_API_SECRET_KEY are required")
     trading = TradingClient(key, secret, paper=paper)
-    scanner = Scanner(trading, StockHistoricalDataClient(key, secret), google_client(), Ledger(LEDGER_DB))
+    scanner = Scanner(
+        trading, StockHistoricalDataClient(key, secret), google_client(),
+        Ledger(LEDGER_DB), hedge_config,
+    )
     run_once = env_bool("AEGIS_RUN_ONCE", False)
     interval = max(30, int(os.getenv("AEGIS_CYCLE_SECONDS", "300")))
     while True:

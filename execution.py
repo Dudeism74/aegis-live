@@ -65,7 +65,7 @@ def submit_order(
     signal_price: float, entry_atr: float | None, rsi: float | None,
     lower_band: float | None, realized_vol: float | None,
     market_direction: str, reason: str, qty: float | None = None,
-    notional: float | None = None,
+    notional: float | None = None, order_role: str = "strategy",
 ) -> Any | None:
     if ledger.has_open_order(symbol, side) or broker_has_open_order(trading_client, symbol, side):
         logging.warning("Duplicate %s order blocked for %s", side.upper(), symbol)
@@ -91,6 +91,7 @@ def submit_order(
         "realized_vol": realized_vol,
         "market_direction": market_direction,
         "reason": reason,
+        "order_role": order_role,
         "latency_ms": latency_ms,
     })
     ledger.record_submitted_order(data)
@@ -133,4 +134,3 @@ def reconcile_pending_orders(
                 on_final(refreshed)
         except Exception as exc:
             logging.error("Failed to reconcile order %s: %s", stored["order_id"], exc)
-

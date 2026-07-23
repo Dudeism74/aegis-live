@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 from alpaca.data.enums import Adjustment, DataFeed
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
 
 
@@ -75,6 +75,46 @@ def get_market_direction(data_client):
     except Exception as exc:
         logging.error("Market-direction calculation failed: %s", exc)
         return "N/A"
+
+
+def get_market_day_returns(
+    data_client, symbols: tuple[str, ...] = ("QQQ", "SPY"), retries: int = 3
+) -> dict[str, float] | None:
+    """Return current session returns from Alpaca snapshots.
+
+    Missing or invalid market data returns ``None`` so the paper risk governor
+    can fail closed for new entries without fabricating a hedge signal.
+    """
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            snapshots = data_client.get_stock_snapshot(
+                StockSnapshotRequest(symbol_or_symbols=list(symbols))
+            )
+            returns: dict[str, float] = {}
+            for symbol in symbols:
+                snapshot = snapshots[symbol]
+                daily_bar = getattr(snapshot, "daily_bar", None)
+                previous_bar = getattr(snapshot, "previous_daily_bar", None)
+                current = float(getattr(daily_bar, "close"))
+                previous = float(getattr(previous_bar, "close"))
+                if current <= 0 or previous <= 0:
+                    raise ValueError(f"Invalid snapshot prices for {symbol}")
+                returns[symbol] = current / previous - 1.0
+            logging.info(
+                "Market session returns: %s",
+                ", ".join(f"{symbol}={value:.2%}" for symbol, value in returns.items()),
+            )
+            return returns
+        except Exception as exc:
+            last_error = exc
+            logging.warning(
+                "Market snapshot %d/%d failed: %s", attempt, retries, exc
+            )
+            if attempt < retries:
+                time.sleep(2)
+    logging.error("Market session returns unavailable: %s", last_error)
+    return None
 
 
 def observe_vix_term_structure(data_client):

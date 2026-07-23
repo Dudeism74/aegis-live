@@ -68,6 +68,7 @@ class Ledger:
                     realized_vol REAL,
                     market_direction TEXT,
                     reason TEXT,
+                    order_role TEXT NOT NULL DEFAULT 'strategy',
                     latency_ms REAL,
                     logged_event_id TEXT,
                     updated_at TEXT NOT NULL
@@ -82,6 +83,13 @@ class Ledger:
                     entry_atr REAL NOT NULL,
                     stop_price REAL NOT NULL,
                     target_price REAL NOT NULL,
+                    opened_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS hedge_positions (
+                    symbol TEXT PRIMARY KEY,
+                    entry_order_id TEXT,
+                    entry_price REAL NOT NULL,
+                    entry_qty REAL NOT NULL,
                     opened_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS trade_events (
@@ -164,6 +172,14 @@ class Ledger:
                     ON reddit_sheet_queue(synced_at, created_at);
                 """
             )
+            order_columns = {
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(orders)")
+            }
+            if "order_role" not in order_columns:
+                conn.execute(
+                    "ALTER TABLE orders ADD COLUMN order_role TEXT NOT NULL "
+                    "DEFAULT 'strategy'"
+                )
 
     def get_metadata(self, key: str, default: str | None = None) -> str | None:
         with self.connect() as conn:
@@ -198,6 +214,7 @@ class Ledger:
             "realized_vol": order.get("realized_vol"),
             "market_direction": order.get("market_direction"),
             "reason": order.get("reason"),
+            "order_role": order.get("order_role", "strategy"),
             "latency_ms": order.get("latency_ms"),
             "logged_event_id": None,
             "updated_at": utc_now(),
@@ -283,6 +300,38 @@ class Ledger:
     def close_position(self, symbol: str) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM positions WHERE symbol=?", (symbol.upper(),))
+
+    def save_hedge_position(
+        self, symbol: str, entry_order_id: str | None, entry_price: float,
+        entry_qty: float, opened_at: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO hedge_positions VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    entry_order_id=excluded.entry_order_id,
+                    entry_price=excluded.entry_price,
+                    entry_qty=excluded.entry_qty,
+                    opened_at=excluded.opened_at
+                """,
+                (
+                    symbol.upper(), entry_order_id, entry_price, entry_qty,
+                    opened_at or utc_now(),
+                ),
+            )
+
+    def get_hedge_position(self, symbol: str):
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM hedge_positions WHERE symbol=?", (symbol.upper(),)
+            ).fetchone()
+
+    def close_hedge_position(self, symbol: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM hedge_positions WHERE symbol=?", (symbol.upper(),)
+            )
 
     def add_trade_event(self, order_id: str, row: list[Any]) -> str:
         existing = self.get_order(order_id)

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 import execution
+import hedge
 import main
 import portfolio
 import risk_manager
@@ -28,9 +30,16 @@ class AccountClient:
         return self.account
 
 
-def order(order_id="1", status="new", side="buy", filled_qty=None, fill_price=None):
+def order(
+    order_id="1",
+    status="new",
+    side="buy",
+    filled_qty=None,
+    fill_price=None,
+    symbol="AMD",
+):
     return SimpleNamespace(
-        id=order_id, client_order_id=f"client-{order_id}", symbol="AMD", side=side,
+        id=order_id, client_order_id=f"client-{order_id}", symbol=symbol, side=side,
         status=status, qty=None, notional="500", filled_qty=filled_qty,
         filled_avg_price=fill_price, submitted_at=None, filled_at=None,
         canceled_at=None, expired_at=None,
@@ -45,20 +54,38 @@ def submitted(
     signal_price=100,
     filled_qty=None,
     fill_price=None,
+    symbol="AMD",
+    order_role="strategy",
 ):
     ledger.record_submitted_order({
-        "order_id": order_id, "client_order_id": f"client-{order_id}", "symbol": "AMD",
+        "order_id": order_id, "client_order_id": f"client-{order_id}", "symbol": symbol,
         "side": side, "status": status, "submitted_notional": 500,
         "filled_qty": filled_qty, "filled_avg_price": fill_price,
         "submitted_at": "2026-07-10T19:45:00+00:00",
         "completed_at": "2026-07-10T19:46:00+00:00" if status in {"filled", "canceled", "rejected", "expired"} else None,
         "signal_price": signal_price, "entry_atr": 4, "rsi": 25, "lower_band": 27,
         "realized_vol": 18, "market_direction": "BULL", "reason": "test",
+        "order_role": order_role,
     })
 
 
 def scanner_for(ledger: Ledger):
     return main.Scanner(AccountClient(), object(), None, ledger)
+
+
+def active_hedge_config(**overrides):
+    values = {
+        "mode": "paper",
+        "symbol": "PSQ",
+        "moderate_qqq_return": -0.01,
+        "severe_qqq_return": -0.015,
+        "moderate_exposure_factor": 0.50,
+        "hedge_ratio": 0.25,
+        "minimum_rebalance_usd": 25.0,
+        "rebalance_tolerance": 0.10,
+    }
+    values.update(overrides)
+    return hedge.HedgeConfig(**values)
 
 
 def queued_row(ledger: Ledger):
@@ -114,12 +141,148 @@ def test_live_mode_requires_matching_account_even_when_authorized(monkeypatch):
         main.validate_trading_mode()
 
 
+def test_active_hedge_mode_is_blocked_for_live_trading():
+    with pytest.raises(RuntimeError):
+        main.validate_hedge_mode(False, active_hedge_config())
+    main.validate_hedge_mode(True, active_hedge_config())
+
+
+def test_qqq_risk_classification_and_entry_scaling():
+    config = active_hedge_config()
+    assert config.classify(-0.009) == hedge.RISK_NORMAL
+    assert config.classify(-0.010) == hedge.RISK_MODERATE
+    assert config.classify(-0.015) == hedge.RISK_SEVERE
+    assert config.classify(None) == hedge.RISK_UNKNOWN
+    assert config.entry_exposure_factor(hedge.RISK_NORMAL) == 1.0
+    assert config.entry_exposure_factor(hedge.RISK_MODERATE) == 0.5
+    assert config.entry_exposure_factor(hedge.RISK_SEVERE) == 0.0
+    assert config.entry_exposure_factor(hedge.RISK_UNKNOWN) == 0.0
+
+
+def test_observe_mode_never_changes_entry_size():
+    config = active_hedge_config(mode="observe")
+    assert config.entry_exposure_factor(hedge.RISK_SEVERE) == 1.0
+    assert config.entry_exposure_factor(hedge.RISK_UNKNOWN) == 1.0
+
+
+def test_hedge_target_is_twenty_five_percent_with_hysteresis():
+    config = active_hedge_config()
+    assert config.target_notional(1000, hedge.RISK_SEVERE, False) == 250
+    assert config.target_notional(1000, hedge.RISK_MODERATE, False) == 0
+    assert config.target_notional(1000, hedge.RISK_MODERATE, True) == 250
+    assert config.target_notional(1000, hedge.RISK_NORMAL, True) == 0
+    assert not config.rebalance_required(230, 250)
+    assert config.rebalance_required(200, 250)
+
+
 def test_ledger_freezes_entry_exits(tmp_path):
     ledger = Ledger(tmp_path / "ledger.db")
     ledger.save_position("AMD", "o1", 100, 5, 4)
     position = ledger.get_position("AMD")
     assert position["stop_price"] == 92
     assert position["target_price"] == 112
+
+
+def test_hedge_position_survives_restart(tmp_path):
+    path = tmp_path / "ledger.db"
+    first = Ledger(path)
+    first.save_hedge_position("PSQ", "hedge-1", 25, 10)
+    reopened = Ledger(path)
+    position = reopened.get_hedge_position("PSQ")
+    assert position["entry_order_id"] == "hedge-1"
+    assert position["entry_price"] == 25
+    assert position["entry_qty"] == 10
+
+
+def test_existing_ledger_migrates_order_role_without_losing_orders(tmp_path):
+    path = tmp_path / "ledger.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE orders (
+                order_id TEXT PRIMARY KEY,
+                client_order_id TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL,
+                submitted_qty REAL,
+                submitted_notional REAL,
+                filled_qty REAL,
+                filled_avg_price REAL,
+                submitted_at TEXT,
+                completed_at TEXT,
+                signal_price REAL,
+                entry_atr REAL,
+                rsi REAL,
+                lower_band REAL,
+                realized_vol REAL,
+                market_direction TEXT,
+                reason TEXT,
+                latency_ms REAL,
+                logged_event_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO orders "
+            "(order_id,client_order_id,symbol,side,status,updated_at) "
+            "VALUES ('old-1','old-client','AMD','buy','new','2026-07-10')"
+        )
+    ledger = Ledger(path)
+    migrated = ledger.get_order("old-1")
+    assert migrated["symbol"] == "AMD"
+    assert migrated["order_role"] == "strategy"
+
+
+def test_confirmed_hedge_buy_uses_separate_ledger_state(monkeypatch, tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    submitted(
+        ledger, status="filled", filled_qty=10, fill_price=25, signal_price=24.9,
+        symbol="PSQ", order_role="hedge",
+    )
+    monkeypatch.setattr(main, "write_trade_to_csv", lambda _row: None)
+    scanner_for(ledger).finalize_order(ledger.get_order("1"))
+    hedge_position = ledger.get_hedge_position("PSQ")
+    assert hedge_position["entry_price"] == 25
+    assert hedge_position["entry_qty"] == 10
+    assert ledger.get_position("PSQ") is None
+    row = queued_row(ledger)
+    assert len(row) == 34
+    assert row[1] == "PSQ"
+    assert row[4:7] == [0.0, 0.0, 0.0]
+
+
+def test_hedge_rebalance_buy_uses_weighted_average_entry(monkeypatch, tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position("PSQ", "hedge-1", 25, 10)
+    submitted(
+        ledger, order_id="hedge-2", status="filled", filled_qty=5, fill_price=28,
+        signal_price=27.9, symbol="PSQ", order_role="hedge",
+    )
+    monkeypatch.setattr(main, "write_trade_to_csv", lambda _row: None)
+    scanner_for(ledger).finalize_order(ledger.get_order("hedge-2"))
+    position = ledger.get_hedge_position("PSQ")
+    assert position["entry_qty"] == 15
+    assert position["entry_price"] == pytest.approx(26)
+
+
+def test_hedge_sell_uses_stored_entry_and_confirmed_quantity(monkeypatch, tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position(
+        "PSQ", "hedge-1", 25, 10, "2026-07-09T19:45:00+00:00"
+    )
+    submitted(
+        ledger, side="sell", status="filled", filled_qty=4, fill_price=27,
+        signal_price=27.1, symbol="PSQ", order_role="hedge",
+    )
+    monkeypatch.setattr(main, "write_trade_to_csv", lambda _row: None)
+    scanner_for(ledger).finalize_order(ledger.get_order("1"))
+    row = queued_row(ledger)
+    assert row[7] == 4
+    assert row[13] == "8.00%"
+    assert row[32] == 8.0
+    assert ledger.get_hedge_position("PSQ")["entry_qty"] == 6
 
 
 def test_trade_event_is_idempotent(tmp_path):
@@ -392,6 +555,189 @@ def test_repeated_sheet_sync_appends_event_once(tmp_path):
     assert sync_trade_queue(gc, ledger) == 1
     assert sync_trade_queue(gc, ledger) == 0
     assert len(appended) == 1
+
+
+def test_market_day_returns_use_current_and_previous_snapshot_closes():
+    snapshots = {
+        "QQQ": SimpleNamespace(
+            daily_bar=SimpleNamespace(close=98),
+            previous_daily_bar=SimpleNamespace(close=100),
+        ),
+        "SPY": SimpleNamespace(
+            daily_bar=SimpleNamespace(close=99),
+            previous_daily_bar=SimpleNamespace(close=100),
+        ),
+    }
+    data = SimpleNamespace(get_stock_snapshot=lambda _request: snapshots)
+    returns = risk_manager.get_market_day_returns(data, retries=1)
+    assert returns["QQQ"] == pytest.approx(-0.02)
+    assert returns["SPY"] == pytest.approx(-0.01)
+
+
+def test_missing_market_snapshot_fails_closed_without_fake_return(monkeypatch):
+    calls = []
+
+    def fail(_request):
+        calls.append(1)
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(risk_manager.time, "sleep", lambda _seconds: None)
+    data = SimpleNamespace(get_stock_snapshot=fail)
+    assert risk_manager.get_market_day_returns(data, retries=3) is None
+    assert len(calls) == 3
+
+
+def test_severe_risk_buys_psq_at_twenty_five_percent_of_gross(
+    monkeypatch, tmp_path
+):
+    ledger = Ledger(tmp_path / "ledger.db")
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AMD", qty="10", market_value="1000")
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_SEVERE
+    scanner.price = lambda _symbol: 25
+    calls = []
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **kwargs: calls.append(kwargs) or SimpleNamespace(id="hedge-1"),
+    )
+    monkeypatch.setattr(main, "wait_for_final_order", lambda *_args, **_kwargs: None)
+    scanner.manage_hedge()
+    assert calls[0]["symbol"] == "PSQ"
+    assert calls[0]["side"] == "buy"
+    assert calls[0]["notional"] == 250
+    assert calls[0]["order_role"] == "hedge"
+
+
+def test_normal_risk_closes_confirmed_psq_hedge(monkeypatch, tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position("PSQ", "hedge-entry", 25, 10)
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AMD", qty="10", market_value="1000"),
+        SimpleNamespace(symbol="PSQ", qty="10", market_value="260"),
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_NORMAL
+    scanner.price = lambda _symbol: 26
+    calls = []
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **kwargs: calls.append(kwargs) or SimpleNamespace(id="hedge-exit"),
+    )
+    monkeypatch.setattr(main, "wait_for_final_order", lambda *_args, **_kwargs: None)
+    scanner.manage_hedge()
+    assert calls[0]["side"] == "sell"
+    assert calls[0]["qty"] == 10
+    assert calls[0]["reason"] == "QQQ Risk Hedge Exit"
+
+
+def test_existing_hedge_is_never_averaged_down(monkeypatch, tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position("PSQ", "hedge-entry", 25, 8)
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AMD", qty="10", market_value="1000"),
+        SimpleNamespace(symbol="PSQ", qty="8", market_value="200"),
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_SEVERE
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **_kwargs: pytest.fail("an open hedge must not be averaged down"),
+    )
+    scanner.manage_hedge()
+
+
+def test_unknown_risk_preserves_existing_hedge(monkeypatch, tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position("PSQ", "hedge-entry", 25, 10)
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AMD", qty="10", market_value="1000"),
+        SimpleNamespace(symbol="PSQ", qty="10", market_value="260"),
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_UNKNOWN
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **_kwargs: pytest.fail("unknown risk must not change hedge"),
+    )
+    scanner.manage_hedge()
+
+
+def test_psq_hedge_is_not_managed_by_atr_exit_logic(monkeypatch, tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position("PSQ", "hedge-entry", 25, 10)
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="PSQ", qty="10", avg_entry_price="25")
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    monkeypatch.setattr(
+        scanner, "ensure_position_state",
+        lambda _position: pytest.fail("PSQ must bypass ATR exit logic"),
+    )
+    scanner.manage_exits()
+
+
+def test_severe_risk_blocks_entry_before_strategy_scan(monkeypatch, tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db")
+    scanner = main.Scanner(
+        AccountClient(), object(), None, ledger, active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_SEVERE
+    now = main.datetime(2026, 7, 10, 15, 50, tzinfo=main.EASTERN)
+    monkeypatch.setattr(risk_manager, "observe_vix_term_structure", lambda _data: None)
+    monkeypatch.setattr(
+        strategy, "check_rsi_buy_signal",
+        lambda *_args: pytest.fail("severe risk must block the strategy scan"),
+    )
+    recap = scanner.scan_entries(now)
+    assert recap["reason"] == "QQQ Severe Risk-Off"
+    assert scanner.last_entry_date == now.date()
+
+
+def test_moderate_risk_halves_otherwise_valid_entry_notional(
+    monkeypatch, tmp_path
+):
+    ledger = Ledger(tmp_path / "ledger.db")
+    trading = AccountClient()
+    trading.get_all_positions = lambda: []
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_MODERATE
+    scanner.market_returns = {"QQQ": -0.012}
+    scanner.price = lambda _symbol: 100
+    now = main.datetime(2026, 7, 10, 15, 50, tzinfo=main.EASTERN)
+    monkeypatch.setattr(risk_manager, "observe_vix_term_structure", lambda _data: None)
+    monkeypatch.setattr(
+        strategy, "check_rsi_buy_signal",
+        lambda _data, symbol: {
+            "is_buy": True, "rsi_7": 20, "lower_band": 25, "atr_14": 4
+        } if symbol == "AMD" else None,
+    )
+    monkeypatch.setattr(portfolio, "calculate_position_size", lambda *_args, **_kwargs: 200)
+    calls = []
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **kwargs: calls.append(kwargs) or None,
+    )
+    scanner.scan_entries(now)
+    assert calls[0]["notional"] == 100
 
 
 def test_realized_vol_failure_returns_none(monkeypatch):
