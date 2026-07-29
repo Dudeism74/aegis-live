@@ -26,6 +26,7 @@ import strategy
 from execution import reconcile_pending_orders, submit_order, wait_for_final_order
 from hedge import (
     RISK_NORMAL,
+    RISK_SEVERE,
     RISK_UNKNOWN,
     HedgeConfig,
 )
@@ -178,6 +179,9 @@ class Scanner:
         self.hedge_config = hedge_config or HedgeConfig.from_env()
         self.market_returns: dict[str, float] = {}
         self.risk_state = RISK_NORMAL if self.hedge_config.mode == "off" else RISK_UNKNOWN
+        self.hedge_entry_streak = 0
+        self.hedge_exit_streak = 0
+        self.hedge_last_observation_at: datetime | None = None
         self.trade_messages: list[str] = []
         self.reddit_sensor = RedditSensor.from_env(ledger, TICKERS)
         self.report_card_ready = False
@@ -262,6 +266,15 @@ class Scanner:
                 )
             else:
                 self.ledger.close_hedge_position(symbol)
+                completed_at = (
+                    order["completed_at"]
+                    or datetime.now(timezone.utc).isoformat()
+                )
+                self.ledger.set_metadata(
+                    self._hedge_last_exit_key(symbol), str(completed_at)
+                )
+                self.hedge_entry_streak = 0
+                self.hedge_exit_streak = 0
             entry_atr = stop_price = target_price = 0.0
         elif side == "buy":
             if entry_atr <= 0:
@@ -316,6 +329,8 @@ class Scanner:
             f"{prefix}{side.upper()} {filled_qty:g} {symbol} "
             f"filled at ${fill_price:.4f} ({status})"
         )
+        if order_role == "hedge" and order["reason"]:
+            message = f"{message} | {order['reason']}"
         self.trade_messages.append(message)
         logging.info(message)
 
@@ -359,6 +374,100 @@ class Scanner:
             self.hedge_config.mode, self.risk_state, qqq_text,
         )
 
+    @staticmethod
+    def _hedge_last_exit_key(symbol: str) -> str:
+        return f"hedge_last_exit_at:{symbol.strip().upper()}"
+
+    def _hedge_cooldown_remaining_minutes(self, now: datetime) -> float:
+        cooldown = self.hedge_config.reentry_cooldown_minutes
+        if cooldown <= 0:
+            return 0.0
+        value = self.ledger.get_metadata(
+            self._hedge_last_exit_key(self.hedge_config.symbol)
+        )
+        if not value:
+            return 0.0
+        try:
+            exited_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if exited_at.tzinfo is None:
+                exited_at = exited_at.replace(tzinfo=timezone.utc)
+            current = now
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=EASTERN)
+            elapsed = (
+                current.astimezone(timezone.utc)
+                - exited_at.astimezone(timezone.utc)
+            ).total_seconds() / 60
+        except (TypeError, ValueError):
+            logging.error(
+                "Invalid hedge exit timestamp %r; preserving the full cooldown",
+                value,
+            )
+            return float(cooldown)
+        return max(0.0, float(cooldown) - max(0.0, elapsed))
+
+    def _reset_stale_hedge_confirmation(self, now: datetime) -> None:
+        previous = self.hedge_last_observation_at
+        if previous is not None:
+            current = now
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=EASTERN)
+            prior = previous
+            if prior.tzinfo is None:
+                prior = prior.replace(tzinfo=EASTERN)
+            gap = current.astimezone(timezone.utc) - prior.astimezone(timezone.utc)
+            if current.date() != prior.date() or gap > timedelta(minutes=15):
+                self.hedge_entry_streak = 0
+                self.hedge_exit_streak = 0
+        self.hedge_last_observation_at = now
+
+    def _confirmed_hedge_target(
+        self,
+        gross_long: float,
+        current_hedge: float,
+        hedge_is_open: bool,
+        now: datetime,
+    ) -> tuple[float, float]:
+        """Return a target after confirmation and durable cooldown controls."""
+        config = self.hedge_config
+        self._reset_stale_hedge_confirmation(now)
+        cooldown_remaining = self._hedge_cooldown_remaining_minutes(now)
+
+        if hedge_is_open:
+            self.hedge_entry_streak = 0
+            if gross_long <= 0:
+                self.hedge_exit_streak = 0
+                return 0.0, cooldown_remaining
+            if self.risk_state == RISK_UNKNOWN:
+                self.hedge_exit_streak = 0
+                return current_hedge, cooldown_remaining
+            if self.risk_state == RISK_NORMAL:
+                self.hedge_exit_streak += 1
+                if self.hedge_exit_streak < config.exit_confirmation_cycles:
+                    return current_hedge, cooldown_remaining
+                return 0.0, cooldown_remaining
+            self.hedge_exit_streak = 0
+            return (
+                config.target_notional(gross_long, self.risk_state, True),
+                cooldown_remaining,
+            )
+
+        self.hedge_exit_streak = 0
+        if (
+            gross_long <= 0
+            or self.risk_state != RISK_SEVERE
+            or cooldown_remaining > 0
+        ):
+            self.hedge_entry_streak = 0
+            return 0.0, cooldown_remaining
+        self.hedge_entry_streak += 1
+        if self.hedge_entry_streak < config.entry_confirmation_cycles:
+            return 0.0, cooldown_remaining
+        return (
+            config.target_notional(gross_long, self.risk_state, False),
+            cooldown_remaining,
+        )
+
     def _position_market_value(self, broker_position: Any) -> float:
         market_value = getattr(broker_position, "market_value", None)
         if market_value is not None:
@@ -386,44 +495,43 @@ class Scanner:
 
     def _submit_hedge_order(
         self, *, side: str, signal_price: float, reason: str,
-        qty: float | None = None, notional: float | None = None,
+        confirmation: str, qty: float | None = None,
+        notional: float | None = None,
     ) -> None:
+        qqq_return = self.market_returns.get("QQQ")
+        if qqq_return is None:
+            logging.error(
+                "Refusing %s hedge order without an exact QQQ session return",
+                side,
+            )
+            return
+        contextual_reason = (
+            f"{reason} | QQQ session {qqq_return:.3%} | {confirmation}"
+        )
         response = submit_order(
             self.trading, self.ledger,
             symbol=self.hedge_config.symbol, side=side, qty=qty, notional=notional,
             signal_price=signal_price, entry_atr=None, rsi=None, lower_band=None,
             realized_vol=self.realized_vol, market_direction=self.market_direction,
-            reason=reason, order_role="hedge",
+            reason=contextual_reason, order_role="hedge",
         )
         if response:
             self.finalize_order(
                 wait_for_final_order(self.trading, self.ledger, str(response.id))
             )
 
-    def manage_hedge(self) -> None:
+    def manage_hedge(self, now: datetime | None = None) -> None:
         """Observe or rebalance the short-term PSQ overlay using confirmed fills."""
         config = self.hedge_config
         if config.mode == "off":
             return
+        now = now or datetime.now(EASTERN)
         broker_positions = list(self.trading.get_all_positions())
         gross_long = self._strategy_gross_long_notional(broker_positions)
         broker_hedge = self._hedge_broker_position(broker_positions)
         local_hedge = self.ledger.get_hedge_position(config.symbol)
         hedge_is_open = broker_hedge is not None and local_hedge is not None
-        target = config.target_notional(gross_long, self.risk_state, hedge_is_open)
         current = self._position_market_value(broker_hedge) if broker_hedge else 0.0
-        logging.info(
-            "Hedge assessment state=%s gross_longs=$%.2f current_%s=$%.2f target=$%.2f",
-            self.risk_state, gross_long, config.symbol, current, target,
-        )
-
-        if config.mode == "observe":
-            return
-        if self.risk_state == RISK_UNKNOWN:
-            logging.warning(
-                "QQQ risk data unavailable; preserving any hedge and refusing hedge orders"
-            )
-            return
         if broker_hedge is not None and local_hedge is None:
             logging.error(
                 "Broker holds %s without Aegis hedge ledger state; refusing to manage it",
@@ -436,13 +544,43 @@ class Scanner:
                 config.symbol,
             )
             return
+        target, cooldown_remaining = self._confirmed_hedge_target(
+            gross_long, current, hedge_is_open, now
+        )
+        logging.info(
+            "Hedge assessment state=%s gross_longs=$%.2f current_%s=$%.2f "
+            "target=$%.2f entry_confirm=%d/%d exit_confirm=%d/%d "
+            "reentry_cooldown=%.1fm",
+            self.risk_state, gross_long, config.symbol, current, target,
+            min(self.hedge_entry_streak, config.entry_confirmation_cycles),
+            config.entry_confirmation_cycles,
+            min(self.hedge_exit_streak, config.exit_confirmation_cycles),
+            config.exit_confirmation_cycles,
+            cooldown_remaining,
+        )
+
+        if config.mode == "observe":
+            return
+        if self.risk_state == RISK_UNKNOWN:
+            logging.warning(
+                "QQQ risk data unavailable; preserving any hedge and refusing hedge orders"
+            )
+            return
 
         if target <= 0:
             if broker_hedge is not None:
                 signal_price = self.price(config.symbol)
+                confirmation = (
+                    "no strategy long exposure"
+                    if gross_long <= 0
+                    else f"exit confirmation "
+                    f"{min(self.hedge_exit_streak, config.exit_confirmation_cycles)}"
+                    f"/{config.exit_confirmation_cycles}"
+                )
                 self._submit_hedge_order(
                     side="sell", qty=float(broker_hedge.qty),
                     signal_price=signal_price, reason="QQQ Risk Hedge Exit",
+                    confirmation=confirmation,
                 )
             return
 
@@ -460,6 +598,11 @@ class Scanner:
             self._submit_hedge_order(
                 side="buy", notional=round(difference, 2),
                 signal_price=signal_price, reason="QQQ Risk Hedge",
+                confirmation=(
+                    f"entry confirmation "
+                    f"{min(self.hedge_entry_streak, config.entry_confirmation_cycles)}"
+                    f"/{config.entry_confirmation_cycles}"
+                ),
             )
             return
         signal_price = self.price(config.symbol)
@@ -468,6 +611,7 @@ class Scanner:
             self._submit_hedge_order(
                 side="sell", qty=round(qty, 6),
                 signal_price=signal_price, reason="QQQ Risk Hedge Rebalance",
+                confirmation="confirmed hedge remains active",
             )
 
     def manage_exits(self) -> None:
@@ -717,7 +861,7 @@ class Scanner:
         self.update_reddit_outcomes(now)
         self.scan_reddit_research(now)
         self.manage_exits()
-        self.manage_hedge()
+        self.manage_hedge(now)
         recap = self.scan_entries(now)
         sync_trade_queue(self.gc, self.ledger, ensure_dashboard_ticker)
         sync_reddit_queue(self.gc, self.ledger)

@@ -25,6 +25,9 @@ class HedgeConfig:
     hedge_ratio: float = 0.25
     minimum_rebalance_usd: float = 25.0
     rebalance_tolerance: float = 0.10
+    entry_confirmation_cycles: int = 3
+    exit_confirmation_cycles: int = 3
+    reentry_cooldown_minutes: int = 120
 
     @classmethod
     def from_env(cls) -> "HedgeConfig":
@@ -46,6 +49,15 @@ class HedgeConfig:
             ),
             rebalance_tolerance=float(
                 os.getenv("AEGIS_HEDGE_REBALANCE_TOLERANCE", "0.10")
+            ),
+            entry_confirmation_cycles=int(
+                os.getenv("AEGIS_HEDGE_ENTRY_CONFIRM_CYCLES", "3")
+            ),
+            exit_confirmation_cycles=int(
+                os.getenv("AEGIS_HEDGE_EXIT_CONFIRM_CYCLES", "3")
+            ),
+            reentry_cooldown_minutes=int(
+                os.getenv("AEGIS_HEDGE_REENTRY_COOLDOWN_MINUTES", "120")
             ),
         )
         config.validate()
@@ -75,6 +87,18 @@ class HedgeConfig:
         if not 0 <= self.rebalance_tolerance <= 1:
             raise RuntimeError(
                 "AEGIS_HEDGE_REBALANCE_TOLERANCE must be between 0 and 1"
+            )
+        if self.entry_confirmation_cycles < 1:
+            raise RuntimeError(
+                "AEGIS_HEDGE_ENTRY_CONFIRM_CYCLES must be at least 1"
+            )
+        if self.exit_confirmation_cycles < 1:
+            raise RuntimeError(
+                "AEGIS_HEDGE_EXIT_CONFIRM_CYCLES must be at least 1"
+            )
+        if self.reentry_cooldown_minutes < 0:
+            raise RuntimeError(
+                "AEGIS_HEDGE_REENTRY_COOLDOWN_MINUTES cannot be negative"
             )
 
     def classify(self, qqq_return: float | None) -> str:

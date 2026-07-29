@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pandas as pd
@@ -62,6 +63,7 @@ def submitted(
     fill_price=None,
     symbol="AMD",
     order_role="strategy",
+    reason="test",
 ):
     ledger.record_submitted_order({
         "order_id": order_id, "client_order_id": f"client-{order_id}", "symbol": symbol,
@@ -70,7 +72,7 @@ def submitted(
         "submitted_at": "2026-07-10T19:45:00+00:00",
         "completed_at": "2026-07-10T19:46:00+00:00" if status in {"filled", "canceled", "rejected", "expired"} else None,
         "signal_price": signal_price, "entry_atr": 4, "rsi": 25, "lower_band": 27,
-        "realized_vol": 18, "market_direction": "BULL", "reason": "test",
+        "realized_vol": 18, "market_direction": "BULL", "reason": reason,
         "order_role": order_role,
     })
 
@@ -89,6 +91,9 @@ def active_hedge_config(**overrides):
         "hedge_ratio": 0.25,
         "minimum_rebalance_usd": 25.0,
         "rebalance_tolerance": 0.10,
+        "entry_confirmation_cycles": 3,
+        "exit_confirmation_cycles": 3,
+        "reentry_cooldown_minutes": 120,
     }
     values.update(overrides)
     return hedge.HedgeConfig(**values)
@@ -169,6 +174,16 @@ def test_observe_mode_never_changes_entry_size():
     config = active_hedge_config(mode="observe")
     assert config.entry_exposure_factor(hedge.RISK_SEVERE) == 1.0
     assert config.entry_exposure_factor(hedge.RISK_UNKNOWN) == 1.0
+
+
+def test_hedge_confirmation_and_cooldown_settings_are_validated():
+    active_hedge_config().validate()
+    with pytest.raises(RuntimeError):
+        active_hedge_config(entry_confirmation_cycles=0).validate()
+    with pytest.raises(RuntimeError):
+        active_hedge_config(exit_confirmation_cycles=0).validate()
+    with pytest.raises(RuntimeError):
+        active_hedge_config(reentry_cooldown_minutes=-1).validate()
 
 
 def test_hedge_target_is_twenty_five_percent_with_hysteresis():
@@ -289,6 +304,34 @@ def test_hedge_sell_uses_stored_entry_and_confirmed_quantity(monkeypatch, tmp_pa
     assert row[13] == "8.00%"
     assert row[32] == 8.0
     assert ledger.get_hedge_position("PSQ")["entry_qty"] == 6
+    assert ledger.get_metadata("hedge_last_exit_at:PSQ") is None
+
+
+def test_full_hedge_exit_records_durable_cooldown_and_alert_context(
+    monkeypatch, tmp_path
+):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position(
+        "PSQ", "hedge-1", 25, 10, "2026-07-09T19:45:00+00:00"
+    )
+    reason = (
+        "QQQ Risk Hedge Exit | QQQ session -0.800% | "
+        "exit confirmation 3/3"
+    )
+    submitted(
+        ledger, side="sell", status="filled", filled_qty=10, fill_price=24.9,
+        signal_price=25, symbol="PSQ", order_role="hedge", reason=reason,
+    )
+    monkeypatch.setattr(main, "write_trade_to_csv", lambda _row: None)
+    scanner = scanner_for(ledger)
+    scanner.finalize_order(ledger.get_order("1"))
+    assert ledger.get_hedge_position("PSQ") is None
+    assert ledger.get_metadata("hedge_last_exit_at:PSQ") == (
+        "2026-07-10T19:46:00+00:00"
+    )
+    assert scanner.trade_messages == [
+        "HEDGE SELL 10 PSQ filled at $24.9000 (filled) | " + reason
+    ]
 
 
 def test_trade_event_is_idempotent(tmp_path):
@@ -633,7 +676,7 @@ def test_missing_market_snapshot_fails_closed_without_fake_return(monkeypatch):
     assert len(calls) == 3
 
 
-def test_severe_risk_buys_psq_at_twenty_five_percent_of_gross(
+def test_severe_risk_requires_three_consecutive_hedge_entry_observations(
     monkeypatch, tmp_path
 ):
     ledger = Ledger(tmp_path / "ledger.db")
@@ -645,6 +688,194 @@ def test_severe_risk_buys_psq_at_twenty_five_percent_of_gross(
         trading, object(), None, ledger, active_hedge_config()
     )
     scanner.risk_state = hedge.RISK_SEVERE
+    scanner.market_returns = {"QQQ": -0.01625}
+    scanner.price = lambda _symbol: 25
+    calls = []
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **kwargs: calls.append(kwargs)
+        or SimpleNamespace(id="hedge-1"),
+    )
+    monkeypatch.setattr(main, "wait_for_final_order", lambda *_args, **_kwargs: None)
+    start = datetime(2026, 7, 29, 10, 0, tzinfo=main.EASTERN)
+
+    scanner.manage_hedge(start)
+    scanner.manage_hedge(start + timedelta(minutes=5))
+    assert calls == []
+
+    scanner.manage_hedge(start + timedelta(minutes=10))
+    assert len(calls) == 1
+    assert calls[0]["notional"] == 250
+    assert calls[0]["reason"] == (
+        "QQQ Risk Hedge | QQQ session -1.625% | "
+        "entry confirmation 3/3"
+    )
+
+
+def test_interrupted_or_stale_severe_sequence_restarts_confirmation(
+    monkeypatch, tmp_path
+):
+    ledger = Ledger(tmp_path / "ledger.db")
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AMD", qty="10", market_value="1000")
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    scanner.price = lambda _symbol: 25
+    calls = []
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **kwargs: calls.append(kwargs)
+        or SimpleNamespace(id="hedge-1"),
+    )
+    monkeypatch.setattr(main, "wait_for_final_order", lambda *_args, **_kwargs: None)
+    start = datetime(2026, 7, 29, 10, 0, tzinfo=main.EASTERN)
+
+    scanner.risk_state = hedge.RISK_SEVERE
+    scanner.market_returns = {"QQQ": -0.016}
+    scanner.manage_hedge(start)
+    scanner.manage_hedge(start + timedelta(minutes=5))
+    scanner.risk_state = hedge.RISK_MODERATE
+    scanner.market_returns = {"QQQ": -0.012}
+    scanner.manage_hedge(start + timedelta(minutes=10))
+    assert scanner.hedge_entry_streak == 0
+
+    scanner.risk_state = hedge.RISK_SEVERE
+    scanner.market_returns = {"QQQ": -0.016}
+    scanner.manage_hedge(start + timedelta(minutes=15))
+    scanner.manage_hedge(start + timedelta(minutes=35))
+    assert scanner.hedge_entry_streak == 1
+    assert calls == []
+
+    scanner.manage_hedge(start + timedelta(minutes=40))
+    scanner.manage_hedge(start + timedelta(minutes=45))
+    assert len(calls) == 1
+
+
+def test_normal_risk_requires_three_consecutive_hedge_exit_observations(
+    monkeypatch, tmp_path
+):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position("PSQ", "hedge-entry", 25, 10)
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AMD", qty="10", market_value="1000"),
+        SimpleNamespace(symbol="PSQ", qty="10", market_value="260"),
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_NORMAL
+    scanner.market_returns = {"QQQ": -0.00875}
+    scanner.price = lambda _symbol: 26
+    calls = []
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **kwargs: calls.append(kwargs)
+        or SimpleNamespace(id="hedge-exit"),
+    )
+    monkeypatch.setattr(main, "wait_for_final_order", lambda *_args, **_kwargs: None)
+    start = datetime(2026, 7, 29, 12, 45, tzinfo=main.EASTERN)
+
+    scanner.manage_hedge(start)
+    scanner.manage_hedge(start + timedelta(minutes=5))
+    assert calls == []
+
+    scanner.manage_hedge(start + timedelta(minutes=10))
+    assert len(calls) == 1
+    assert calls[0]["qty"] == 10
+    assert calls[0]["reason"] == (
+        "QQQ Risk Hedge Exit | QQQ session -0.875% | "
+        "exit confirmation 3/3"
+    )
+
+
+def test_full_exit_cooldown_survives_restart_and_requires_fresh_confirmation(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "ledger.db"
+    ledger = Ledger(path)
+    exited_at = datetime(2026, 7, 29, 13, 0, tzinfo=timezone.utc)
+    ledger.set_metadata("hedge_last_exit_at:PSQ", exited_at.isoformat())
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AMD", qty="10", market_value="1000")
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, Ledger(path), active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_SEVERE
+    scanner.market_returns = {"QQQ": -0.02}
+    scanner.price = lambda _symbol: 25
+    calls = []
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **kwargs: calls.append(kwargs)
+        or SimpleNamespace(id="hedge-2"),
+    )
+    monkeypatch.setattr(main, "wait_for_final_order", lambda *_args, **_kwargs: None)
+
+    scanner.manage_hedge(exited_at + timedelta(minutes=115))
+    assert scanner.hedge_entry_streak == 0
+    assert calls == []
+
+    scanner.manage_hedge(exited_at + timedelta(minutes=121))
+    scanner.manage_hedge(exited_at + timedelta(minutes=126))
+    assert calls == []
+
+    scanner.manage_hedge(exited_at + timedelta(minutes=131))
+    assert len(calls) == 1
+
+
+def test_no_strategy_longs_close_hedge_without_waiting_for_confirmation(
+    monkeypatch, tmp_path
+):
+    ledger = Ledger(tmp_path / "ledger.db")
+    ledger.save_hedge_position("PSQ", "hedge-entry", 25, 10)
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="PSQ", qty="10", market_value="260")
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger, active_hedge_config()
+    )
+    scanner.risk_state = hedge.RISK_SEVERE
+    scanner.market_returns = {"QQQ": -0.02}
+    scanner.price = lambda _symbol: 26
+    calls = []
+    monkeypatch.setattr(
+        main, "submit_order",
+        lambda *_args, **kwargs: calls.append(kwargs)
+        or SimpleNamespace(id="hedge-exit"),
+    )
+    monkeypatch.setattr(main, "wait_for_final_order", lambda *_args, **_kwargs: None)
+
+    scanner.manage_hedge(
+        datetime(2026, 7, 29, 13, 0, tzinfo=main.EASTERN)
+    )
+    assert len(calls) == 1
+    assert calls[0]["reason"] == (
+        "QQQ Risk Hedge Exit | QQQ session -2.000% | "
+        "no strategy long exposure"
+    )
+
+
+def test_severe_risk_buys_psq_at_twenty_five_percent_of_gross(
+    monkeypatch, tmp_path
+):
+    ledger = Ledger(tmp_path / "ledger.db")
+    trading = AccountClient()
+    trading.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AMD", qty="10", market_value="1000")
+    ]
+    scanner = main.Scanner(
+        trading, object(), None, ledger,
+        active_hedge_config(entry_confirmation_cycles=1),
+    )
+    scanner.risk_state = hedge.RISK_SEVERE
+    scanner.market_returns = {"QQQ": -0.016}
     scanner.price = lambda _symbol: 25
     calls = []
     monkeypatch.setattr(
@@ -668,9 +899,11 @@ def test_normal_risk_closes_confirmed_psq_hedge(monkeypatch, tmp_path):
         SimpleNamespace(symbol="PSQ", qty="10", market_value="260"),
     ]
     scanner = main.Scanner(
-        trading, object(), None, ledger, active_hedge_config()
+        trading, object(), None, ledger,
+        active_hedge_config(exit_confirmation_cycles=1),
     )
     scanner.risk_state = hedge.RISK_NORMAL
+    scanner.market_returns = {"QQQ": -0.009}
     scanner.price = lambda _symbol: 26
     calls = []
     monkeypatch.setattr(
@@ -681,7 +914,10 @@ def test_normal_risk_closes_confirmed_psq_hedge(monkeypatch, tmp_path):
     scanner.manage_hedge()
     assert calls[0]["side"] == "sell"
     assert calls[0]["qty"] == 10
-    assert calls[0]["reason"] == "QQQ Risk Hedge Exit"
+    assert calls[0]["reason"] == (
+        "QQQ Risk Hedge Exit | QQQ session -0.900% | "
+        "exit confirmation 1/1"
+    )
 
 
 def test_existing_hedge_is_never_averaged_down(monkeypatch, tmp_path):

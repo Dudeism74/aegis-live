@@ -76,6 +76,9 @@ AEGIS_HEDGE_MODERATE_EXPOSURE_FACTOR=0.50
 AEGIS_HEDGE_RATIO=0.25
 AEGIS_HEDGE_MIN_REBALANCE_USD=25
 AEGIS_HEDGE_REBALANCE_TOLERANCE=0.10
+AEGIS_HEDGE_ENTRY_CONFIRM_CYCLES=3
+AEGIS_HEDGE_EXIT_CONFIRM_CYCLES=3
+AEGIS_HEDGE_REENTRY_COOLDOWN_MINUTES=120
 ```
 
 Observation mode logs the QQQ risk state and hypothetical PSQ target, but it
@@ -91,13 +94,24 @@ reduce threshold churn, then closes when the state returns to normal or no
 Aegis-managed longs remain. If QQQ snapshot data is unavailable, new entries
 are blocked, and any existing hedge is left unchanged.
 
+PSQ entry requires three consecutive severe observations, and a normal-state
+exit requires three consecutive observations. With the standard five-minute
+cycle, each confirmation takes about fifteen minutes. A full confirmed exit
+starts a durable 120-minute reentry cooldown that survives process restarts.
+An interrupted sequence, a gap longer than fifteen minutes, or a new trading
+day resets confirmation. The immediate QQQ entry governor is unchanged:
+severe risk still blocks new strategy longs while hedge confirmation is
+pending. Closing PSQ because no Aegis-managed longs remain is immediate.
+
 An open hedge may be reduced as strategy exposure falls, but it is never
 averaged down or increased during the same risk event.
 
 PSQ is excluded from the five-position strategy limit and from ATR stop/target
 management. Hedge submissions, fills, reconciliation, restart recovery, and
 Google Sheet rows use the same confirmed-fill-only ledger path as strategy
-orders. The existing Sheet1 column layout is unchanged.
+orders. Every hedge reason and email alert includes the QQQ session return and
+the applicable confirmation state. The existing Sheet1 column layout is
+unchanged.
 
 PSQ targets the inverse of the Nasdaq-100's daily return. It is a short-term
 overlay, not a permanent holding. Product source:
