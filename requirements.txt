@@ -1,0 +1,8 @@
+alpaca-py
+gspread
+numpy
+pandas
+python-dotenv
+pytest
+requests
+ta
