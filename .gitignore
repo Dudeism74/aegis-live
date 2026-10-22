@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+credentials.json
+*service-account*.json
+*.pem
+*.key
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.log
+aegis.lock
